@@ -100,6 +100,76 @@ class StatusResponse(BaseModel):
     weather: str
     ai_provider: Optional[str] = None
     games_cached: int
+    games_source: Optional[str] = None
+    last_odds_sync_at: Optional[datetime] = None
+    last_odds_sync_error: Optional[str] = None
+    tracking_enabled: bool = False
+    calibration_samples: int = 0
+
+
+LegOutcome = Literal["pending", "win", "loss", "push"]
+
+
+class SaveParlayRequest(BaseModel):
+    parlay: ParlayResponse
+    stake: float = Field(ge=0, le=100000)
+
+
+class SavedParlayRecord(BaseModel):
+    id: str
+    session_id: str
+    stake: float
+    combined_american: int
+    combined_implied_prob: float
+    estimated_win_prob: float
+    risk: RiskLevel
+    same_game: bool
+    outcome: LegOutcome
+    legs: list[dict]
+    leg_outcomes: list[LegOutcome]
+    summary: Optional[str] = None
+    generated_at: datetime
+    saved_at: datetime
+    settled_at: Optional[datetime] = None
+
+
+class SetLegOutcomeRequest(BaseModel):
+    leg_index: int = Field(ge=0)
+    outcome: Literal["win", "loss", "push"]
+
+
+class PerformanceStats(BaseModel):
+    total_parlays: int
+    pending: int
+    wins: int
+    losses: int
+    pushes: int
+    leg_hit_rate: Optional[float] = None
+    model_predicted_rate: Optional[float] = None
+    calibration_gap: Optional[float] = None
+
+
+class ConfirmSettlementRequest(BaseModel):
+    outcomes: list[SetLegOutcomeRequest] = Field(min_length=1)
+
+
+class LegSettlementSuggestion(BaseModel):
+    leg_index: int
+    outcome: Optional[Literal["win", "loss", "push"]] = None
+    score_display: Optional[str] = None
+    reason: str
+    ready: bool = False
+
+
+class SettlementSuggestionResponse(BaseModel):
+    ready: bool
+    suggestions: list[LegSettlementSuggestion]
+    message: Optional[str] = None
+
+
+class SuggestSettlementRequest(BaseModel):
+    legs: list[dict]
+    leg_outcomes: list[LegOutcome] = Field(default_factory=list)
 
 
 class ChatRequest(BaseModel):

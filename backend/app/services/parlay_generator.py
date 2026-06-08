@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 
 from app.models.schemas import GameSummary, ParlayRequest, ParlayResponse, PickLeg, RiskLevel
 from app.services.ai_assistant import explain_parlay
+from app.services.calibration import calibration_adjustment, ensure_calibration_loaded
 from app.services.context import get_game_context
 from app.services.odds import get_todays_games
 
@@ -74,7 +75,15 @@ def payout_on_100(american: int) -> float:
     return round(100 * (100 / abs(american)), 2)
 
 
-def _win_probability(implied: float, ctx: dict, *, home_side: bool, market: str) -> Tuple[float, float]:
+def _win_probability(
+    implied: float,
+    ctx: dict,
+    *,
+    home_side: bool,
+    market: str,
+    sport: str,
+    risk: RiskLevel,
+) -> Tuple[float, float]:
     """Estimate true win chance above market implied using context signals."""
     boost = 0.0
     line_move = ctx.get("line_move", 0.0)
@@ -94,6 +103,25 @@ def _win_probability(implied: float, ctx: dict, *, home_side: bool, market: str)
 
     win_prob = max(0.05, min(0.92, implied + boost))
     confidence = min(0.95, 0.45 + abs(boost) * 2 + (0.1 if abs(line_move) > 0.02 else 0))
+    return round(win_prob, 4), round(confidence, 4)
+
+
+async def _win_probability_calibrated(
+    implied: float,
+    ctx: dict,
+    *,
+    home_side: bool,
+    market: str,
+    sport: str,
+    risk: RiskLevel,
+) -> Tuple[float, float]:
+    win_prob, confidence = _win_probability(
+        implied, ctx, home_side=home_side, market=market, sport=sport, risk=risk
+    )
+    await ensure_calibration_loaded()
+    adj = calibration_adjustment(sport, market, risk, win_prob)
+    if adj:
+        win_prob = max(0.05, min(0.92, win_prob + adj))
     return round(win_prob, 4), round(confidence, 4)
 
 
@@ -136,7 +164,7 @@ def _total_rationale(game: GameSummary, ctx: Dict, side: str, win_prob: float) -
     return f"Matchup + market price favor {side} {game.total} (~{win_prob:.0%} model win rate)."
 
 
-async def _candidate_legs(game: GameSummary, profile: dict) -> List[dict]:
+async def _candidate_legs(game: GameSummary, profile: dict, risk: RiskLevel) -> List[dict]:
     ctx = await get_game_context(game)
     legs: List[dict] = []
     matchup = f"{game.away_team} @ {game.home_team}"
@@ -149,7 +177,9 @@ async def _candidate_legs(game: GameSummary, profile: dict) -> List[dict]:
 
     if game.moneyline_home is not None:
         imp = american_to_implied(game.moneyline_home)
-        win_prob, confidence = _win_probability(imp, ctx, home_side=True, market="moneyline")
+        win_prob, confidence = await _win_probability_calibrated(
+            imp, ctx, home_side=True, market="moneyline", sport=game.sport, risk=risk
+        )
         maybe_add(
             game_id=game.id,
             sport=game.sport,
@@ -166,7 +196,9 @@ async def _candidate_legs(game: GameSummary, profile: dict) -> List[dict]:
 
     if game.moneyline_away is not None:
         imp = american_to_implied(game.moneyline_away)
-        win_prob, confidence = _win_probability(imp, ctx, home_side=False, market="moneyline")
+        win_prob, confidence = await _win_probability_calibrated(
+            imp, ctx, home_side=False, market="moneyline", sport=game.sport, risk=risk
+        )
         maybe_add(
             game_id=game.id,
             sport=game.sport,
@@ -187,7 +219,9 @@ async def _candidate_legs(game: GameSummary, profile: dict) -> List[dict]:
             ("away", game.spread_away_odds, f"{game.away_team} {-game.spread_home:+.1f}", False),
         ):
             imp = american_to_implied(odds)
-            win_prob, confidence = _win_probability(imp, ctx, home_side=home_side, market="spread")
+            win_prob, confidence = await _win_probability_calibrated(
+                imp, ctx, home_side=home_side, market="spread", sport=game.sport, risk=risk
+            )
             maybe_add(
                 game_id=game.id,
                 sport=game.sport,
@@ -213,7 +247,9 @@ async def _candidate_legs(game: GameSummary, profile: dict) -> List[dict]:
             sides.reverse()
         for side, odds, selection in sides:
             imp = american_to_implied(odds)
-            win_prob, confidence = _win_probability(imp, ctx, home_side=True, market="total")
+            win_prob, confidence = await _win_probability_calibrated(
+                imp, ctx, home_side=True, market="total", sport=game.sport, risk=risk
+            )
             maybe_add(
                 game_id=game.id,
                 sport=game.sport,
@@ -358,7 +394,7 @@ async def _generate_same_game_parlay(req: ParlayRequest) -> ParlayResponse:
     if not game:
         raise ValueError("Game not found — refresh the board and pick a listed matchup")
 
-    candidates = await _candidate_legs(game, profile)
+    candidates = await _candidate_legs(game, profile, req.risk)
     if len(candidates) < 2:
         raise ValueError(
             "This game doesn't have enough markets (need ML, spread, and/or total)"
@@ -400,7 +436,7 @@ async def generate_parlay(req: ParlayRequest) -> ParlayResponse:
     games = await get_todays_games(req.sport)
     candidates: List[dict] = []
     for game in games:
-        candidates.extend(await _candidate_legs(game, profile))
+        candidates.extend(await _candidate_legs(game, profile, req.risk))
 
     if not candidates:
         raise ValueError("No qualifying legs for this risk level — try Balanced or another sport")

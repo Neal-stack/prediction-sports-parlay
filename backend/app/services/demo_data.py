@@ -69,6 +69,30 @@ def demo_games() -> List[GameSummary]:
     ]
 
 
+def demo_final_scores() -> Dict[str, dict]:
+    """Final scores for demo games (always available in demo mode)."""
+    specs = [
+        ("nba-001", "Boston Celtics", "Miami Heat", 112, 105),
+        ("nba-002", "Denver Nuggets", "Phoenix Suns", 118, 114),
+        ("nfl-001", "Kansas City Chiefs", "Buffalo Bills", 27, 24),
+        ("mlb-001", "New York Yankees", "Boston Red Sox", 5, 3),
+        ("nhl-001", "Edmonton Oilers", "Vancouver Canucks", 4, 2),
+    ]
+
+    results: Dict[str, dict] = {}
+    for gid, home, away, home_score, away_score in specs:
+        results[gid] = {
+            "game_id": gid,
+            "home_team": home,
+            "away_team": away,
+            "home_score": home_score,
+            "away_score": away_score,
+            "game_status": "final",
+            "score_display": f"{away} {away_score} @ {home} {home_score}",
+        }
+    return results
+
+
 # Context signals used by parlay scorer (demo)
 CONTEXT: Dict[str, dict] = {
     "nba-001": {

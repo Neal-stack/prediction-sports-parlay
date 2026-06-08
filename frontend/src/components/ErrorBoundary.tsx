@@ -1,0 +1,27 @@
+"use client";
+
+import { Component, type ReactNode } from "react";
+
+type Props = { children: ReactNode; fallback?: ReactNode };
+type State = { hasError: boolean };
+
+export class ErrorBoundary extends Component<Props, State> {
+  state: State = { hasError: false };
+
+  static getDerivedStateFromError(): State {
+    return { hasError: true };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        this.props.fallback ?? (
+          <p className="text-sm text-red-400" role="alert">
+            Something went wrong loading this section. Refresh the page.
+          </p>
+        )
+      );
+    }
+    return this.props.children;
+  }
+}

@@ -39,7 +39,12 @@ Open [http://localhost:3000](http://localhost:3000).
 
 1. Go to [supabase.com/dashboard](https://supabase.com/dashboard)
 2. Open your project (or create one)
-3. **SQL Editor** → paste and run `supabase/migrations/001_initial.sql`
+3. **SQL Editor** → run migrations **in order**:
+   - `supabase/migrations/001_initial.sql`
+   - `supabase/migrations/002_service_role_grants.sql`
+   - `supabase/migrations/003_parlay_tracking.sql`
+   - `supabase/migrations/004_tracking_grants.sql`
+   - `supabase/migrations/005_game_scores.sql`
 4. **Settings → API** (left sidebar)
 5. Copy these into `backend/.env`:
    - **Project URL** → `SUPABASE_URL`
@@ -99,20 +104,36 @@ No key needed — uses [Open-Meteo](https://open-meteo.com).
 | Risk levels | Safe / Balanced / Bold — optimizes win prob vs payout |
 | Games board | Today's slate with odds; tap a game for line movement chart |
 | Edge panel | Sliders to set your win % per leg vs implied odds |
-| Bankroll tracker | Local tracker with 5% max stake guardrail |
+| Parlay tracker | Save slips, mark leg results, bankroll with 5% max stake |
+| Model calibration | Your leg results improve future win-probability estimates |
 | AI analyst | Explains parlays + chat (OpenAI or Gemini) |
+
+## Track results & improve the model
+
+1. **Generate** a parlay and click **Save parlay** in the tracker (set your stake).
+2. **Wait** for games to finish.
+3. **Return** and expand the saved slip — tap **Check results** to auto-grade from final scores, then **Confirm all** (or override individual legs).
+4. The app records outcomes and **calibrates** future picks (needs Supabase migrations below).
+
+Results sync to Supabase when configured; they also persist in your browser via localStorage.
 
 ## API
 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | Health check |
-| `GET /api/status` | Active integrations |
+| `GET /api/status` | Active integrations + sync health |
 | `GET /api/games` | Today's games |
 | `GET /api/games/{id}/line-movement` | Odds history for chart |
 | `POST /api/parlay/generate` | `{ "legs": 3, "risk": "balanced" }` |
 | `POST /api/parlay/analyze-edge` | User probability vs implied |
-| `POST /api/chat` | AI analyst |
+| `POST /api/chat` | AI analyst (rate limited) |
+| `POST /api/tracking/parlays` | Save a parlay slip |
+| `GET /api/tracking/parlays` | List saved slips (session header) |
+| `PATCH /api/tracking/parlays/{id}/legs` | Record leg result |
+| `POST /api/tracking/suggest` | Auto-grade pending legs from final scores |
+| `POST /api/tracking/parlays/{id}/confirm` | Confirm suggested results |
+| `GET /api/tracking/performance` | Win/loss stats + calibration gap |
 
 ## Deploy (when ready)
 

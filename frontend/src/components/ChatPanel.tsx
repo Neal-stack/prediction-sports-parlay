@@ -7,7 +7,7 @@ type Props = {
   parlay: ParlayResponse | null;
 };
 
-type Message = { role: "user" | "assistant"; text: string };
+type Message = { id: string; role: "user" | "assistant"; text: string };
 
 export function ChatPanel({ parlay }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -18,17 +18,25 @@ export function ChatPanel({ parlay }: Props) {
     e.preventDefault();
     const text = input.trim();
     if (!text || loading) return;
+    if (!parlay) return;
 
     setInput("");
-    setMessages((m) => [...m, { role: "user", text }]);
+    setMessages((m) => [
+      ...m,
+      { id: crypto.randomUUID(), role: "user", text },
+    ]);
     setLoading(true);
     try {
       const reply = await sendChat(text, parlay);
-      setMessages((m) => [...m, { role: "assistant", text: reply }]);
+      setMessages((m) => [
+        ...m,
+        { id: crypto.randomUUID(), role: "assistant", text: reply },
+      ]);
     } catch (err) {
       setMessages((m) => [
         ...m,
         {
+          id: crypto.randomUUID(),
           role: "assistant",
           text: err instanceof Error ? err.message : "Chat unavailable",
         },
@@ -44,19 +52,21 @@ export function ChatPanel({ parlay }: Props) {
         Ask the analyst
       </p>
       <p className="mt-1 text-sm text-zinc-400">
-        Dual AI when both keys are set: Gemini pulls signals (free), OpenAI
-        synthesizes on complex questions. Generate a parlay first.
+        {parlay
+          ? "Ask about this slip — line movement, risk, or alternatives."
+          : "Generate a parlay first to unlock the analyst."}
       </p>
 
-      <div className="mt-3 max-h-48 space-y-2 overflow-y-auto">
-        {messages.length === 0 && (
+      <div className="mt-3 max-h-48 space-y-2 overflow-y-auto" aria-live="polite">
+        {messages.length === 0 && parlay && (
           <p className="text-xs text-zinc-600">
-            Try: &quot;Why is this parlay safe?&quot; or &quot;What would change if I go Bold?&quot;
+            Try: &quot;Why is this parlay safe?&quot; or &quot;What would change
+            if I go Bold?&quot;
           </p>
         )}
-        {messages.map((m, i) => (
+        {messages.map((m) => (
           <div
-            key={i}
+            key={m.id}
             className={`rounded-lg px-3 py-2 text-sm ${
               m.role === "user"
                 ? "ml-8 bg-emerald-950/40 text-zinc-200"
@@ -72,12 +82,13 @@ export function ChatPanel({ parlay }: Props) {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask about this slip…"
-          className="flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500/50"
+          placeholder={parlay ? "Ask about this slip…" : "Generate a parlay first"}
+          disabled={!parlay}
+          className="flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-50"
         />
         <button
           type="submit"
-          disabled={loading || !input.trim()}
+          disabled={loading || !input.trim() || !parlay}
           className="rounded-lg bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
         >
           {loading ? "…" : "Send"}

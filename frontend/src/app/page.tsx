@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { BankrollPanel } from "@/components/BankrollPanel";
+import { useCallback, useEffect, useState } from "react";
 import { ChatPanel } from "@/components/ChatPanel";
 import { EdgePanel } from "@/components/EdgePanel";
 import { GamesBoard } from "@/components/GamesBoard";
 import { ParlayCard } from "@/components/ParlayCard";
+import { ParlayTrackerPanel } from "@/components/ParlayTrackerPanel";
 import {
   fetchGames,
   fetchStatus,
@@ -28,6 +28,7 @@ const SPORTS = [
 export default function Home() {
   const [parlay, setParlay] = useState<ParlayResponse | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [legCount, setLegCount] = useState(3);
@@ -35,27 +36,46 @@ export default function Home() {
   const [sport, setSport] = useState("");
   const [parlayMode, setParlayMode] = useState<"multi" | "same-game">("multi");
   const [games, setGames] = useState<GameSummary[]>([]);
+  const [gamesLoading, setGamesLoading] = useState(true);
+  const [gamesError, setGamesError] = useState<string | null>(null);
   const [gameId, setGameId] = useState("");
 
-  useEffect(() => {
-    fetchStatus().then(setStatus).catch(() => null);
+  const loadStatus = useCallback(() => {
+    fetchStatus()
+      .then(setStatus)
+      .catch((e) =>
+        setStatusError(e instanceof Error ? e.message : "Backend unreachable")
+      );
   }, []);
 
-  useEffect(() => {
-    if (parlayMode !== "same-game") return;
-    const loadSport = sport || "nba";
-    fetchGames(loadSport)
+  const loadGames = useCallback(() => {
+    setGamesLoading(true);
+    setGamesError(null);
+    const filter = parlayMode === "same-game" ? sport || "nba" : sport || undefined;
+    fetchGames(filter)
       .then((list) => {
         setGames(list);
-        setGameId((prev) =>
-          prev && list.some((g) => g.id === prev) ? prev : list[0]?.id ?? ""
-        );
+        if (parlayMode === "same-game") {
+          setGameId((prev) =>
+            prev && list.some((g) => g.id === prev) ? prev : list[0]?.id ?? ""
+          );
+        }
       })
-      .catch(() => {
+      .catch((e) => {
         setGames([]);
         setGameId("");
-      });
-  }, [parlayMode, sport]);
+        setGamesError(e instanceof Error ? e.message : "Failed to load games");
+      })
+      .finally(() => setGamesLoading(false));
+  }, [sport, parlayMode]);
+
+  useEffect(() => {
+    loadStatus();
+  }, [loadStatus]);
+
+  useEffect(() => {
+    loadGames();
+  }, [loadGames]);
 
   async function handleGenerate() {
     setLoading(true);
@@ -77,6 +97,8 @@ export default function Home() {
   }
 
   const live = status && !status.demo_mode && status.sharpapi;
+  const sameGameGames =
+    parlayMode === "same-game" ? games : games;
 
   return (
     <main className="flex flex-1 flex-col items-center px-4 py-12 sm:py-16">
@@ -91,11 +113,25 @@ export default function Home() {
         {status && (
           <p className="mt-2 text-xs text-zinc-600">
             {live
-              ? `Live · ${status.games_cached} games`
+              ? `Live · ${status.games_cached} games · ${status.games_source ?? "unknown"}`
               : "Check backend/.env for live data"}
             {status.ai_provider
               ? ` · AI: ${status.ai_provider}`
               : " · AI offline"}
+            {status.tracking_enabled ? " · tracking on" : ""}
+            {status.calibration_samples
+              ? ` · ${status.calibration_samples} calibration legs`
+              : ""}
+          </p>
+        )}
+        {statusError && (
+          <p className="mt-1 text-xs text-amber-500" role="alert">
+            {statusError}
+          </p>
+        )}
+        {status?.last_odds_sync_error && (
+          <p className="mt-1 text-xs text-amber-600">
+            Odds sync: {status.last_odds_sync_error}
           </p>
         )}
       </div>
@@ -184,10 +220,10 @@ export default function Home() {
             onChange={(e) => setGameId(e.target.value)}
             className="w-full max-w-md rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500/50"
           >
-            {games.length === 0 && (
+            {sameGameGames.length === 0 && (
               <option value="">No games — try NBA sport filter</option>
             )}
-            {games.map((g) => (
+            {sameGameGames.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.away_team} @ {g.home_team}
               </option>
@@ -221,20 +257,29 @@ export default function Home() {
       )}
 
       <div className="mt-12 flex w-full flex-col items-center gap-10">
-        <GamesBoard sport={sport} />
+        <GamesBoard
+          sport={sport}
+          games={games}
+          loading={gamesLoading}
+          error={gamesError}
+          onRetry={loadGames}
+        />
 
         {parlay && (
           <div className="flex w-full max-w-lg flex-col items-center gap-6">
             <ParlayCard parlay={parlay} />
             <EdgePanel parlay={parlay} />
-            <BankrollPanel parlay={parlay} />
+            <ParlayTrackerPanel
+              parlay={parlay}
+              trackingEnabled={status?.tracking_enabled}
+            />
             <ChatPanel parlay={parlay} />
           </div>
         )}
 
         {!parlay && (
           <>
-            <BankrollPanel parlay={null} />
+            <ParlayTrackerPanel trackingEnabled={status?.tracking_enabled} parlay={null} />
             <ChatPanel parlay={null} />
           </>
         )}

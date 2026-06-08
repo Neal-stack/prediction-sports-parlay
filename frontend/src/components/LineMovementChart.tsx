@@ -18,11 +18,19 @@ export function LineMovementChart({ gameId, homeTeam }: Props) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const controller = new AbortController();
     setLoading(true);
     fetchLineMovement(gameId)
-      .then(setPoints)
-      .catch(() => setPoints([]))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        if (!controller.signal.aborted) setPoints(data);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setPoints([]);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
   }, [gameId]);
 
   if (loading) {

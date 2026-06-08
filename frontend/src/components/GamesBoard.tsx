@@ -1,33 +1,90 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LineMovementChart } from "@/components/LineMovementChart";
-import { fetchGames, formatAmerican, type GameSummary } from "@/lib/api";
+import { formatAmerican, type GameSummary } from "@/lib/api";
 
 type Props = {
   sport?: string;
+  games?: GameSummary[];
+  loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 };
 
-export function GamesBoard({ sport }: Props) {
-  const [games, setGames] = useState<GameSummary[]>([]);
-  const [loading, setLoading] = useState(true);
+export function GamesBoard({
+  sport,
+  games: externalGames,
+  loading: externalLoading,
+  error,
+  onRetry,
+}: Props) {
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [internalGames, setInternalGames] = useState<GameSummary[]>([]);
+  const [internalLoading, setInternalLoading] = useState(!externalGames);
+  const mounted = useRef(true);
+
+  const games = externalGames ?? internalGames;
+  const loading = externalLoading ?? internalLoading;
 
   useEffect(() => {
-    setLoading(true);
-    fetchGames(sport || undefined)
-      .then(setGames)
-      .catch(() => setGames([]))
-      .finally(() => setLoading(false));
-  }, [sport]);
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (externalGames) return;
+    setInternalLoading(true);
+    import("@/lib/api")
+      .then(({ fetchGames }) => fetchGames(sport || undefined))
+      .then((list) => {
+        if (mounted.current) setInternalGames(list);
+      })
+      .catch(() => {
+        if (mounted.current) setInternalGames([]);
+      })
+      .finally(() => {
+        if (mounted.current) setInternalLoading(false);
+      });
+  }, [sport, externalGames]);
 
   if (loading) {
     return <p className="text-sm text-zinc-600">Loading today&apos;s board…</p>;
   }
 
+  if (error) {
+    return (
+      <div className="text-sm text-red-400" role="alert">
+        {error}
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="ml-2 underline hover:text-red-300"
+          >
+            Retry
+          </button>
+        )}
+      </div>
+    );
+  }
+
   if (games.length === 0) {
     return (
-      <p className="text-sm text-zinc-600">No games on the board right now.</p>
+      <p className="text-sm text-zinc-600">
+        No games on the board right now.
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="ml-2 text-zinc-500 underline hover:text-zinc-300"
+          >
+            Refresh
+          </button>
+        )}
+      </p>
     );
   }
 
