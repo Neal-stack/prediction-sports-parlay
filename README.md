@@ -130,17 +130,43 @@ Results sync to Supabase when configured; they also persist in your browser via 
 | `POST /api/tracking/parlays/{id}/confirm` | Confirm suggested results |
 | `GET /api/tracking/performance` | Win/loss stats + calibration gap |
 
-## Deploy (when ready)
+## Deploy
 
-Configs are included — no deploy needed until you're ready.
+Live:
 
-| App | Platform | Root dir | Key env |
-|-----|----------|----------|---------|
-| Frontend | Vercel | `frontend/` | `NEXT_PUBLIC_API_URL` |
-| Backend | Railway | `backend/` | All keys from `.env.example` |
-| DB | Supabase | — | Already hosted |
+- **App:** [prediction-sports-parlay.vercel.app](https://prediction-sports-parlay.vercel.app)
+- **API:** [prediction-parlay-api.onrender.com](https://prediction-parlay-api.onrender.com)
 
-After Vercel deploy, set `CORS_ORIGINS=https://your-app.vercel.app` on Railway.
+| App | Platform | Root dir | Notes |
+|-----|----------|----------|-------|
+| Frontend | Vercel | `frontend/` | Env: `NEXT_PUBLIC_API_URL` = the Render API URL |
+| Backend | Render (free) | `backend/` | Defined by `render.yaml` blueprint at repo root |
+| DB | Supabase | — | Already hosted; run all migrations |
+
+### Backend → Render
+
+1. [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint** → connect this repo. Render reads `render.yaml` and creates the `prediction-parlay-api` web service (Python, free plan, root dir `backend`).
+2. Fill the secret env vars when prompted: `GEMINI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `OPENAI_API_KEY` (optional), `CORS_ORIGINS`. The rest are baked into `render.yaml`.
+3. Verify `https://<service>.onrender.com/health` returns `{"status":"ok"}`.
+
+### Frontend → Vercel
+
+1. [vercel.com/new](https://vercel.com/new) → import this repo.
+2. **Root Directory = `frontend`** (monorepo — preset auto-detects Next.js).
+3. Env var `NEXT_PUBLIC_API_URL` = the Render API URL (no trailing slash; leave it non-sensitive).
+4. Deploy.
+
+### Wire CORS (required)
+
+On Render → `prediction-parlay-api` → **Environment**, set `CORS_ORIGINS` to your Vercel URL (keep localhost for dev):
+
+```
+https://prediction-sports-parlay.vercel.app,http://localhost:3000
+```
+
+Without this the live site shows "Failed to fetch" (browser origin blocked).
+
+> **Free-tier note:** the Render service spins down after ~15 min idle; the first request then takes ~30–50s to wake, and the background odds scheduler pauses while asleep. The board still loads live data via on-demand ESPN fetches.
 
 ## Project structure
 
