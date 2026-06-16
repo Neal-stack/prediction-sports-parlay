@@ -24,7 +24,7 @@ export type PickLeg = {
   game_id: string;
   sport: string;
   matchup: string;
-  market: "moneyline" | "spread" | "total";
+  market: "moneyline" | "spread" | "total" | "player_prop";
   selection: string;
   odds_american: number;
   implied_prob: number;
@@ -32,6 +32,12 @@ export type PickLeg = {
   confidence: number;
   score: number;
   rationale: string;
+  edge?: number | null;
+  model_source?: "model" | "market_fallback" | null;
+  player?: string | null;
+  stat?: string | null;
+  prop_line?: number | null;
+  prop_side?: "over" | "under" | null;
   user_probability?: number | null;
   edge_vs_implied?: number | null;
 };
@@ -46,6 +52,8 @@ export type ParlayResponse = {
   same_game: boolean;
   summary: string;
   ai_insight?: string | null;
+  anchors?: PickLeg[];
+  book_check_passed?: boolean;
   generated_at: string;
 };
 
@@ -110,16 +118,17 @@ export type PerformanceStats = {
 
 export type StatusResponse = {
   demo_mode: boolean;
-  sharpapi: boolean;
+  odds_source?: string | null;
+  espn?: boolean;
   supabase: boolean;
-  api_sports: boolean;
-  gnews: boolean;
+  player_props?: boolean;
   weather: string;
   ai_provider?: string | null;
   games_cached: number;
   games_source?: string | null;
   last_odds_sync_at?: string | null;
   last_odds_sync_error?: string | null;
+  odds_requests_remaining?: number | null;
   tracking_enabled?: boolean;
   calibration_samples?: number;
 };

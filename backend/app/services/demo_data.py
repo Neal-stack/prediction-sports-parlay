@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 
@@ -93,41 +95,86 @@ def demo_final_scores() -> Dict[str, dict]:
     return results
 
 
-# Context signals used by parlay scorer (demo)
+def _demo_context(
+    *,
+    home_win_prob: float,
+    expected_margin: float,
+    projected_total: float,
+    posted_total: float,
+    lean: str,
+    inj_home: float = 0.0,
+    inj_away: float = 0.0,
+    factors: List[str] | None = None,
+    props: List[dict] | None = None,
+) -> dict:
+    return {
+        "base_home_win_prob": home_win_prob,
+        "base_reason": "ok",
+        "home_win_prob": home_win_prob,
+        "expected_margin": expected_margin,
+        "projected_total": projected_total,
+        "total_lean": lean,
+        "total_confidence": 0.55 if lean != "neutral" else 0.0,
+        "model_source": "model",
+        "weather_factor": 0.0,
+        "line_move": 0.02,
+        "injury_margin_home": inj_home,
+        "injury_margin_away": inj_away,
+        "injuries_home": [],
+        "injuries_away": [],
+        "home_news": [],
+        "away_news": [],
+        "key_factors": factors or [],
+        "prop_angles": props or [],
+        "narrative": "",
+        "research_source": "demo",
+    }
+
+
+# Context signals used by the parlay scorer (demo mode).
+# These showcase the independent model producing edge vs the posted line.
 CONTEXT: Dict[str, dict] = {
-    "nba-001": {
-        "line_move": 0.04,
-        "injury_penalty_home": 0.0,
-        "injury_penalty_away": 0.06,
-        "weather_factor": 0.0,
-        "news_sentiment": 0.02,
-    },
-    "nba-002": {
-        "line_move": -0.02,
-        "injury_penalty_home": 0.03,
-        "injury_penalty_away": 0.0,
-        "weather_factor": 0.0,
-        "news_sentiment": -0.01,
-    },
-    "nfl-001": {
-        "line_move": 0.03,
-        "injury_penalty_home": 0.0,
-        "injury_penalty_away": 0.04,
-        "weather_factor": -0.02,
-        "news_sentiment": 0.05,
-    },
-    "mlb-001": {
-        "line_move": 0.01,
-        "injury_penalty_home": 0.02,
-        "injury_penalty_away": 0.0,
-        "weather_factor": 0.03,
-        "news_sentiment": 0.0,
-    },
-    "nhl-001": {
-        "line_move": 0.0,
-        "injury_penalty_home": 0.01,
-        "injury_penalty_away": 0.01,
-        "weather_factor": 0.0,
-        "news_sentiment": 0.01,
-    },
+    "nba-001": _demo_context(
+        home_win_prob=0.69,
+        expected_margin=6.0,
+        projected_total=221.0,
+        posted_total=218.5,
+        lean="over",
+        inj_away=3.0,
+        factors=["Celtics rest edge", "Heat missing a rotation wing"],
+        props=[{"player": "Jaylen Brown", "stat": "points", "direction": "over", "confidence": 0.62}],
+    ),
+    "nba-002": _demo_context(
+        home_win_prob=0.58,
+        expected_margin=2.5,
+        projected_total=226.0,
+        posted_total=224.0,
+        lean="over",
+        inj_home=2.0,
+        factors=["Nuggets home altitude", "Suns on a back-to-back"],
+    ),
+    "nfl-001": _demo_context(
+        home_win_prob=0.6,
+        expected_margin=3.5,
+        projected_total=46.0,
+        posted_total=47.5,
+        lean="under",
+        factors=["Chiefs home edge", "Cold weather caps scoring"],
+    ),
+    "mlb-001": _demo_context(
+        home_win_prob=0.57,
+        expected_margin=0.6,
+        projected_total=9.1,
+        posted_total=8.5,
+        lean="over",
+        factors=["Yankees bullpen rested", "Hitter-friendly wind"],
+    ),
+    "nhl-001": _demo_context(
+        home_win_prob=0.55,
+        expected_margin=0.4,
+        projected_total=6.2,
+        posted_total=6.5,
+        lean="neutral",
+        factors=["Oilers top line clicking"],
+    ),
 }

@@ -1,19 +1,28 @@
 # Parlay — Prediction Market MVP
 
-Generate uncorrelated parlays from live odds, line movement, injuries, weather, and news. Risk-aware slips with edge analysis, bankroll tracking, and optional AI chat.
+Generate parlays from an **independent win-probability model** (team power ratings, injuries, rest, weather) and compare it to the betting line to find edge. Odds are used only for payout math — never to drive the pick. Risk-aware slips, player-prop anchors, edge analysis, bankroll tracking, and AI research/chat.
+
+**Runs 100% free with zero keys** — ESPN (odds, scores, injuries, news, player stats) and Open-Meteo (weather) need no key. Add a free Gemini key to sharpen picks with the AI research pass. That's the only key worth adding.
 
 ## Stack
 
-| Layer | Tech |
-|-------|------|
-| Frontend | Next.js 16, Tailwind 4 |
-| Backend | FastAPI + APScheduler |
-| DB | Supabase |
-| Odds | SharpAPI |
-| Injuries | API-Sports |
-| News | GNews |
-| Weather | Open-Meteo (no key) |
-| AI | OpenAI or Gemini (optional) |
+| Layer | Tech | Key? |
+|-------|------|------|
+| Frontend | Next.js 16, Tailwind 4 | — |
+| Backend | FastAPI + APScheduler | — |
+| DB | Supabase | optional |
+| Odds + scores + injuries + news | **ESPN** (free, no key) | none |
+| Player stats + box scores (NBA props) | **ESPN** (free, no key) | none |
+| Weather | Open-Meteo | none |
+| AI research + chat | **Gemini 2.5 Flash-Lite** (free) | free key |
+| Richer multi-book odds | The Odds API (optional) | free 500/mo |
+
+### How the model works
+
+1. **Independent base probability** — each team's power rating comes from season scoring margin + win rate (ESPN standings), adjusted for home edge, **rest / back-to-backs** (a team on a B2B is penalized), and *player-weighted* injuries (a starting QB out hurts far more than a backup). Converted to win probability with a per-sport logistic. This number does **not** look at the line.
+2. **Gemini research pass** — before picks are made, Gemini reads injuries/news and returns a small, bounded structured signal (±8% max) plus prop angles. Cached per game; chat reuses the same cache. If Gemini is offline or rate-limited, the model runs without it.
+3. **Edge** — model probability minus the market's implied probability. Legs are selected by edge + risk-weighted win probability, not by odds bands.
+4. **Player-prop anchors** — NBA props projected from real ESPN season averages, surfaced as optional add-ons. Angles come from the Gemini research pass, with an ESPN season-leaders fallback when Gemini is unavailable (so props work with no AI key). Free sources don't expose live prop *lines*, so lines are model-derived and labeled as such. Added props are graded automatically from ESPN box scores at settlement.
 
 ## Quick start
 
@@ -35,65 +44,46 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ## API keys — step by step
 
-### 1. Supabase (required for live data)
+**None of these are required.** With an empty `.env` the app uses ESPN + Open-Meteo (all free, no key) and serves real games, odds, scores, the independent model, **and NBA player-prop anchors** (props fall back to ESPN season leaders when there's no AI key). Add Gemini to make the picks smarter.
 
-1. Go to [supabase.com/dashboard](https://supabase.com/dashboard)
-2. Open your project (or create one)
-3. **SQL Editor** → run migrations **in order**:
+### 1. Gemini — AI research pass (free, the one key worth adding)
+
+This is what makes the picks smart: Gemini reads injuries/news pre-generation and feeds a structured signal into the model, and powers the chat analyst.
+
+1. Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+2. **Create API key** → "Create API key in new project" (avoids a `limit: 0` quota trap)
+3. Paste → `GEMINI_API_KEY` in `backend/.env`
+
+> The free tier lives on the current-gen model. Keep `GEMINI_MODEL=gemini-2.5-flash-lite` (the default) — older `gemini-2.0-flash` returns `limit: 0` on free keys. The key looks like `AQ.…` or `AIza…` depending on when it was issued; both work.
+
+### 2. Supabase — tracking + line history (optional)
+
+Without it, the parlay tracker still works via your browser's localStorage; you just lose cross-device sync, line-movement history, and model calibration.
+
+1. Go to [supabase.com/dashboard](https://supabase.com/dashboard) → open/create a project
+2. **SQL Editor** → run migrations **in order**:
    - `supabase/migrations/001_initial.sql`
    - `supabase/migrations/002_service_role_grants.sql`
    - `supabase/migrations/003_parlay_tracking.sql`
    - `supabase/migrations/004_tracking_grants.sql`
    - `supabase/migrations/005_game_scores.sql`
-4. **Settings → API** (left sidebar)
-5. Copy these into `backend/.env`:
+   - `supabase/migrations/006_player_props.sql`
+3. **Settings → API** → copy into `backend/.env`:
    - **Project URL** → `SUPABASE_URL`
-   - **service_role** key (under "Project API keys") → `SUPABASE_SERVICE_KEY`
+   - **service_role** key → `SUPABASE_SERVICE_KEY`
 
-> Use the **service_role** key, not the `anon` key. The backend needs write access for odds snapshots.
+> Use the **service_role** key, not the `anon` key — the backend needs write access.
 
-### 2. SharpAPI (required for live odds)
+### 3. The Odds API — richer multi-book lines (optional)
 
-1. Sign up at [sharpapi.io](https://sharpapi.io)
-2. Dashboard → API Keys
-3. Copy → `SHARPAPI_KEY` in `backend/.env`
+ESPN odds are the free default and are plenty for most use. Only add this for sharper multi-book numbers. Free tier is **500 credits/month**, so keep `ODDS_SYNC_MINUTES` ≥ 30.
 
-### 3. API-Sports (recommended — injuries)
+1. Get a key at [the-odds-api.com](https://the-odds-api.com/)
+2. Paste → `ODDS_API_KEY`
 
-1. Register at [dashboard.api-football.com/register](https://dashboard.api-football.com/register)
-2. **Account → My Access** → copy API key
-3. Paste → `API_SPORTS_KEY`
+### 4. OpenAI — optional paid AI fallback
 
-### 4. GNews (recommended — team news)
-
-1. Sign up at [gnews.io](https://gnews.io)
-2. Dashboard → API key
-3. Paste → `GNEWS_API_KEY`
-
-### 5. AI chat (optional — pick one)
-
-**ChatGPT Plus ($20/mo) does NOT include API access.** It's a separate product for chatting at chatgpt.com. For this app you need a developer API key:
-
-**Option A — OpenAI (recommended)**
-1. Go to [platform.openai.com](https://platform.openai.com)
-2. Create account → **API keys** → Create new key
-3. Add billing (pay-per-use; `gpt-4o-mini` is ~$0.15/1M input tokens)
-4. Paste → `OPENAI_API_KEY` in `backend/.env`
-
-**Option B — Gemini (free tier)**
-1. Go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
-2. Create key → `GEMINI_API_KEY`
-
-**Dual AI mode** (when both keys are set):
-- **Parlay insight:** Gemini extracts signals (free) → OpenAI writes the summary (small/cheap call)
-- **Simple chat:** Gemini only (free, saves OpenAI usage)
-- **Complex chat** (risk, strategy, compare): Gemini signals → OpenAI answer
-
-> OpenAI API is pay-per-use (~pennies with `gpt-4o-mini`), not included in ChatGPT Plus.
-
-### 6. Weather
-
-No key needed — uses [Open-Meteo](https://open-meteo.com).
+Not needed — Gemini covers AI for free. If you already have an OpenAI key, set `OPENAI_API_KEY` and it's used only when Gemini is unavailable. (ChatGPT Plus is **not** API access.)
 
 ---
 
@@ -101,19 +91,24 @@ No key needed — uses [Open-Meteo](https://open-meteo.com).
 
 | Feature | Description |
 |---------|-------------|
-| Risk levels | Safe / Balanced / Bold — optimizes win prob vs payout |
+| Independent model | Win probability from team power ratings + injuries + rest, not the line |
+| Per-leg edge | Each leg shows implied %, model %, and edge; flags where the model beats the market |
+| Risk levels | Safe / Balanced / Bold — re-weight win probability vs edge |
+| Player-prop anchors | NBA props projected from season averages, surfaced as optional add-ons |
+| Book-check | Generated slips are validated against sportsbook conflict rules |
 | Games board | Today's slate with odds; tap a game for line movement chart |
 | Edge panel | Sliders to set your win % per leg vs implied odds |
 | Parlay tracker | Save slips, mark leg results, bankroll with 5% max stake |
-| Model calibration | Your leg results improve future win-probability estimates |
-| AI analyst | Explains parlays + chat (OpenAI or Gemini) |
+| Model calibration | Confirmed leg results tune future win-probability estimates |
+| AI analyst | Pre-generation research pass + chat (Gemini, OpenAI fallback) |
 
 ## Track results & improve the model
 
-1. **Generate** a parlay and click **Save parlay** in the tracker (set your stake).
-2. **Wait** for games to finish.
-3. **Return** and expand the saved slip — tap **Check results** to auto-grade from final scores, then **Confirm all** (or override individual legs).
-4. The app records outcomes and **calibrates** future picks (needs Supabase migrations below).
+1. **Generate** a parlay. Optionally add a **Suggested anchor** (a player prop) to the slip with **+ Add** — it recomputes combined odds and joins the legs.
+2. Click **Save parlay** in the tracker (set your stake).
+3. **Wait** for games to finish.
+4. **Return** and expand the saved slip — tap **Check results** to auto-grade. Game lines grade from final scores; player props grade from ESPN box scores. Then **Confirm all** (or override individual legs).
+5. The app records outcomes and **calibrates** future picks (needs Supabase).
 
 Results sync to Supabase when configured; they also persist in your browser via localStorage.
 

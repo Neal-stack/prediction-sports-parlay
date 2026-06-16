@@ -98,6 +98,28 @@ def grade_total(
     return "push"
 
 
+def grade_player_prop(
+    *,
+    stat: str,
+    prop_line: float,
+    prop_side: str,
+    box_score: dict,
+) -> LegResult:
+    """Grade an over/under player prop from a final box score."""
+    actual = box_score.get(stat)
+    if actual is None:
+        raise ValueError(f"No box-score value for stat '{stat}'")
+    actual = float(actual)
+    if actual == prop_line:
+        return "push"
+    went_over = actual > prop_line
+    if prop_side == "over":
+        return "win" if went_over else "loss"
+    if prop_side == "under":
+        return "win" if not went_over else "loss"
+    raise ValueError(f"Unknown prop side: {prop_side}")
+
+
 def grade_leg(
     *,
     market: str,

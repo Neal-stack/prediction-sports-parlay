@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Tuple
 
+from app.config import settings
 from app.db.async_db import run_sync
 from app.db.supabase import get_supabase
 
@@ -93,6 +94,9 @@ async def record_leg_outcome(
 ) -> None:
     sb = get_supabase()
     if not sb:
+        return
+    # Quality gate: never poison calibration with demo or non-real outcomes.
+    if settings.use_demo_data:
         return
 
     bucket = prob_bucket(predicted_win_prob)

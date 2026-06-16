@@ -18,9 +18,10 @@ from app.models.schemas import (
     SettlementSuggestionResponse,
     SuggestSettlementRequest,
 )
+from app.services import player_stats
 from app.services.calibration import compute_parlay_outcome, record_leg_outcome
 from app.services.scores import get_game_result, sync_scores_for_game_ids
-from app.services.settlement import grade_leg
+from app.services.settlement import grade_leg, grade_player_prop
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,65 @@ async def get_parlay(session_id: str, parlay_id: str) -> Optional[SavedParlayRec
         return None
 
 
+def _coerce_dt(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if value:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
+
+
+async def _grade_prop_leg(index: int, leg: dict, result: dict) -> LegSettlementSuggestion:
+    """Grade a player_prop leg from a box score once its game is final."""
+    sport = leg.get("sport") or result.get("sport") or ""
+    stat = leg.get("stat")
+    prop_line = leg.get("prop_line")
+    prop_side = leg.get("prop_side")
+    player = leg.get("player", "")
+    if not (stat and prop_line is not None and prop_side):
+        return LegSettlementSuggestion(
+            leg_index=index, reason="Prop leg missing data — settle manually", ready=False
+        )
+
+    box = await player_stats.fetch_player_box_score(
+        sport,
+        leg.get("game_id", ""),
+        result["home_team"],
+        result["away_team"],
+        _coerce_dt(result.get("start_time")),
+        player=player,
+        player_id=leg.get("player_id"),
+    )
+    if not box or box.get(stat) is None:
+        return LegSettlementSuggestion(
+            leg_index=index,
+            reason=f"Box score for {player} not available yet — check back or settle manually",
+            score_display=result.get("score_display"),
+            ready=False,
+        )
+
+    try:
+        outcome = grade_player_prop(
+            stat=stat, prop_line=float(prop_line), prop_side=prop_side, box_score=box
+        )
+    except (ValueError, TypeError):
+        return LegSettlementSuggestion(
+            leg_index=index, reason="Could not grade prop — settle manually", ready=False
+        )
+
+    actual = box.get(stat)
+    return LegSettlementSuggestion(
+        leg_index=index,
+        outcome=outcome,
+        score_display=f"{player}: {actual} {stat}",
+        reason=f"{player} had {actual} {stat} (line {prop_line:g} {prop_side}) → {outcome}",
+        ready=True,
+    )
+
+
 async def suggest_settlement(body: SuggestSettlementRequest) -> SettlementSuggestionResponse:
     legs = body.legs
     leg_outcomes = body.leg_outcomes or ["pending"] * len(legs)
@@ -262,6 +322,14 @@ async def suggest_settlement(body: SuggestSettlementRequest) -> SettlementSugges
                     ready=False,
                 )
             )
+            continue
+
+        # Player props grade from the box score, not the game score.
+        if leg.get("market") == "player_prop":
+            graded = await _grade_prop_leg(i, leg, result)
+            suggestions.append(graded)
+            if not graded.ready:
+                all_ready = False
             continue
 
         try:

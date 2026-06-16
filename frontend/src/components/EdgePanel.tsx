@@ -68,14 +68,20 @@ export function EdgePanel({ parlay }: Props) {
       </p>
 
       <ul className="mt-4 space-y-4">
-        {parlay.legs.map((leg, i) => (
-          <li key={`${leg.game_id}-${leg.market}`}>
+        {parlay.legs.map((leg, i) => {
+          const prob =
+            typeof probs[i] === "number" && !Number.isNaN(probs[i])
+              ? probs[i]
+              : leg.win_probability;
+          const pct = Math.round(prob * 100);
+          return (
+          <li key={`${leg.game_id}-${leg.market}-${leg.selection}-${i}`}>
             <div className="flex items-center justify-between text-sm">
               <label htmlFor={`edge-${i}`} className="text-zinc-200">
                 {leg.selection}
               </label>
               <span className="font-mono text-zinc-400" aria-live="polite">
-                {formatPercent(probs[i])}
+                {formatPercent(prob)}
               </span>
             </div>
             <input
@@ -83,9 +89,9 @@ export function EdgePanel({ parlay }: Props) {
               type="range"
               min={5}
               max={95}
-              value={Math.round(probs[i] * 100)}
+              value={pct}
               onChange={(e) => updateProb(i, Number(e.target.value) / 100)}
-              aria-valuenow={Math.round(probs[i] * 100)}
+              aria-valuenow={pct}
               aria-valuemin={5}
               aria-valuemax={95}
               className="mt-2 w-full accent-emerald-500"
@@ -95,7 +101,8 @@ export function EdgePanel({ parlay }: Props) {
               <span>Model {formatPercent(leg.win_probability)}</span>
             </div>
           </li>
-        ))}
+          );
+        })}
       </ul>
 
       {loading && <p className="mt-3 text-xs text-zinc-600">Recalculating…</p>}

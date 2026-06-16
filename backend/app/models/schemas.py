@@ -15,7 +15,7 @@ class PickLeg(BaseModel):
     game_id: str
     sport: str
     matchup: str
-    market: Literal["moneyline", "spread", "total"]
+    market: Literal["moneyline", "spread", "total", "player_prop"]
     selection: str
     odds_american: int
     implied_prob: float
@@ -23,6 +23,14 @@ class PickLeg(BaseModel):
     confidence: float
     score: float
     rationale: str
+    edge: Optional[float] = None  # model win prob - implied prob
+    model_source: Optional[str] = None  # "model" | "market_fallback"
+    # Player prop fields (market == "player_prop")
+    player: Optional[str] = None
+    player_id: Optional[str] = None
+    stat: Optional[str] = None
+    prop_line: Optional[float] = None
+    prop_side: Optional[str] = None  # "over" | "under"
     user_probability: Optional[float] = None
     edge_vs_implied: Optional[float] = None
 
@@ -44,6 +52,8 @@ class ParlayResponse(BaseModel):
     same_game: bool = False
     summary: str
     ai_insight: Optional[str] = None
+    anchors: list[PickLeg] = Field(default_factory=list)  # optional high-confidence add-ons
+    book_check_passed: bool = True
     generated_at: datetime
 
 
@@ -93,16 +103,17 @@ class EdgeAnalysisResponse(BaseModel):
 
 class StatusResponse(BaseModel):
     demo_mode: bool
-    sharpapi: bool
+    odds_source: Optional[str] = None  # "espn" | "odds_api" | "sharpapi"
+    espn: bool = True
     supabase: bool
-    api_sports: bool
-    gnews: bool
+    player_props: bool = False
     weather: str
     ai_provider: Optional[str] = None
     games_cached: int
     games_source: Optional[str] = None
     last_odds_sync_at: Optional[datetime] = None
     last_odds_sync_error: Optional[str] = None
+    odds_requests_remaining: Optional[int] = None
     tracking_enabled: bool = False
     calibration_samples: int = 0
 

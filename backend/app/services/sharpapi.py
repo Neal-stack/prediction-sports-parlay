@@ -6,8 +6,6 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from app.config import settings
-from app.db.supabase import get_supabase
-from app.models.schemas import GameSummary
 
 SHARP_BASE = "https://api.sharpapi.io/api/v1"
 LEAGUES = ["nba", "nfl", "mlb", "nhl"]
@@ -202,71 +200,5 @@ async def fetch_live_events() -> List[dict]:
     return result
 
 
-def _to_game_summary(row: dict, odds: Optional[dict] = None) -> GameSummary:
-    odds = odds or {}
-    return GameSummary(
-        id=row["id"],
-        sport=row["sport"],
-        home_team=row["home_team"],
-        away_team=row["away_team"],
-        start_time=row["start_time"],
-        venue=row.get("venue"),
-        is_outdoor=bool(row.get("is_outdoor", False)),
-        moneyline_home=odds.get("moneyline_home") or row.get("moneyline_home"),
-        moneyline_away=odds.get("moneyline_away") or row.get("moneyline_away"),
-        spread_home=odds.get("spread_home") or row.get("spread_home"),
-        spread_home_odds=odds.get("spread_home_odds") or row.get("spread_home_odds") or -110,
-        spread_away_odds=odds.get("spread_away_odds") or row.get("spread_away_odds") or -110,
-        total=odds.get("total") or row.get("total"),
-        over_odds=odds.get("over_odds") or row.get("over_odds") or -110,
-        under_odds=odds.get("under_odds") or row.get("under_odds") or -110,
-    )
-
-
-async def persist_events(events: List[dict]) -> int:
-    sb = get_supabase()
-    if not sb:
-        return 0
-
-    try:
-        _persist_events(sb, events)
-        return len(events)
-    except Exception:
-        return 0
-
-
-def _persist_events(sb, events: List[dict]) -> None:
-    for ev in events:
-        game_row = {
-            "id": ev["id"],
-            "sport": ev["sport"],
-            "home_team": ev["home_team"],
-            "away_team": ev["away_team"],
-            "start_time": ev["start_time"].isoformat(),
-            "venue": ev.get("venue"),
-            "is_outdoor": ev.get("is_outdoor", False),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        sb.table("games").upsert(game_row).execute()
-
-        snapshot = {
-            "game_id": ev["id"],
-            "book": "consensus",
-            "moneyline_home": ev.get("moneyline_home"),
-            "moneyline_away": ev.get("moneyline_away"),
-            "spread_home": ev.get("spread_home"),
-            "spread_home_odds": ev.get("spread_home_odds", -110),
-            "spread_away_odds": ev.get("spread_away_odds", -110),
-            "total": ev.get("total"),
-            "over_odds": ev.get("over_odds", -110),
-            "under_odds": ev.get("under_odds", -110),
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-        }
-        sb.table("odds_snapshots").insert(snapshot).execute()
-
-
-async def sync_odds() -> int:
-    events = await fetch_live_events()
-    if not events:
-        return 0
-    return await persist_events(events)
+# Normalization + persistence now live in app.services.odds (source-agnostic).
+# This module only fetches and shapes SharpAPI rows into event dicts.

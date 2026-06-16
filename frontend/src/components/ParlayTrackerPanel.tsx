@@ -24,6 +24,7 @@ import {
   loadTrackerState,
   localPerformance,
   potentialPayout,
+  removeParlay,
   saveTrackerState,
   settleBankroll,
   trimParlays,
@@ -243,6 +244,13 @@ export function ParlayTrackerPanel({ parlay, trackingEnabled }: Props) {
     return suggestions[parlayId]?.suggestions.find((s) => s.leg_index === legIndex);
   }
 
+  function handleRemove(parlayId: string) {
+    const next = removeParlay({ bankroll, parlays: saved }, parlayId);
+    persist(next.bankroll, next.parlays);
+    if (expanded === parlayId) setExpanded(null);
+    setMessage("Parlay removed from tracker.");
+  }
+
   const maxStake = bankroll * MAX_STAKE_PCT;
   const pending = saved.filter((p) => p.outcome === "pending").length;
 
@@ -399,6 +407,13 @@ export function ParlayTrackerPanel({ parlay, trackingEnabled }: Props) {
                         Confirm all
                       </button>
                     )}
+                    <button
+                      type="button"
+                      onClick={() => handleRemove(p.id)}
+                      className="rounded bg-zinc-900 px-2 py-1 text-[10px] uppercase tracking-wide text-red-400 hover:bg-zinc-800"
+                    >
+                      Remove
+                    </button>
                   </div>
                 )}
 

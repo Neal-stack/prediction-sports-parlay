@@ -1,48 +1,41 @@
 from __future__ import annotations
 
 import itertools
-import random
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from app.models.schemas import GameSummary, ParlayRequest, ParlayResponse, PickLeg, RiskLevel
+from app.config import settings
+from app.services import power_model, props
 from app.services.ai_assistant import explain_parlay
 from app.services.calibration import calibration_adjustment, ensure_calibration_loaded
 from app.services.context import get_game_context
 from app.services.odds import get_todays_games
+from app.services.settlement import parse_matchup, parse_spread, team_match
 
+# Risk profiles now key off MODEL edge and win probability, not implied-odds
+# bands. Safe favors high win probability; Bold favors edge/payout. Odds are
+# used only for payout math, never to drive the pick.
 RISK_PROFILES: Dict[RiskLevel, dict] = {
     "safe": {
-        "target_implied": 0.58,
-        "min_leg_implied": 0.52,
-        "max_leg_implied": 0.72,
-        "min_combined_american": 180,
-        "max_combined_implied": 0.32,
-        "min_win_prob": 0.22,
-        "context_weight": 2.2,
-        "price_weight": 1.6,
+        "min_leg_win": 0.55,
+        "min_combined_win": 0.18,
+        "w_win": 1.0,
+        "w_edge": 1.2,
         "label": "Safe",
     },
     "balanced": {
-        "target_implied": 0.48,
-        "min_leg_implied": 0.43,
-        "max_leg_implied": 0.60,
-        "min_combined_american": 350,
-        "max_combined_implied": 0.20,
-        "min_win_prob": 0.14,
-        "context_weight": 1.6,
-        "price_weight": 1.0,
+        "min_leg_win": 0.48,
+        "min_combined_win": 0.10,
+        "w_win": 0.6,
+        "w_edge": 2.2,
         "label": "Balanced",
     },
     "bold": {
-        "target_implied": 0.40,
-        "min_leg_implied": 0.36,
-        "max_leg_implied": 0.52,
-        "min_combined_american": 650,
-        "max_combined_implied": 0.11,
-        "min_win_prob": 0.07,
-        "context_weight": 1.2,
-        "price_weight": 0.7,
+        "min_leg_win": 0.40,
+        "min_combined_win": 0.05,
+        "w_win": 0.3,
+        "w_edge": 3.0,
         "label": "Bold",
     },
 }
@@ -75,196 +68,114 @@ def payout_on_100(american: int) -> float:
     return round(100 * (100 / abs(american)), 2)
 
 
-def _win_probability(
-    implied: float,
-    ctx: dict,
-    *,
-    home_side: bool,
-    market: str,
-    sport: str,
-    risk: RiskLevel,
-) -> Tuple[float, float]:
-    """Estimate true win chance above market implied using context signals."""
-    boost = 0.0
-    line_move = ctx.get("line_move", 0.0)
-    if home_side:
-        boost += line_move * 1.5
-        boost -= ctx.get("injury_penalty_home", 0.0) * 1.2
-        boost += ctx.get("injury_penalty_away", 0.0) * 0.8
-        boost += ctx.get("news_sentiment", 0.0) * 1.0
-    else:
-        boost -= line_move * 1.5
-        boost -= ctx.get("injury_penalty_away", 0.0) * 1.2
-        boost += ctx.get("injury_penalty_home", 0.0) * 0.8
-        boost -= ctx.get("news_sentiment", 0.0) * 1.0
-
-    if market == "total":
-        boost += ctx.get("weather_factor", 0.0) * 0.8
-
-    win_prob = max(0.05, min(0.92, implied + boost))
-    confidence = min(0.95, 0.45 + abs(boost) * 2 + (0.1 if abs(line_move) > 0.02 else 0))
-    return round(win_prob, 4), round(confidence, 4)
+def _confidence(edge: float, model_source: str, extra: float = 0.0) -> float:
+    base = 0.55 if model_source == "model" else 0.38
+    return round(min(0.95, base + min(0.3, abs(edge) * 4) + extra), 4)
 
 
-async def _win_probability_calibrated(
-    implied: float,
-    ctx: dict,
-    *,
-    home_side: bool,
-    market: str,
-    sport: str,
-    risk: RiskLevel,
-) -> Tuple[float, float]:
-    win_prob, confidence = _win_probability(
-        implied, ctx, home_side=home_side, market=market, sport=sport, risk=risk
-    )
+async def _maybe_calibrate(win_prob: float, sport: str, market: str, risk: RiskLevel) -> float:
     await ensure_calibration_loaded()
     adj = calibration_adjustment(sport, market, risk, win_prob)
     if adj:
-        win_prob = max(0.05, min(0.92, win_prob + adj))
-    return round(win_prob, 4), round(confidence, 4)
+        win_prob = max(0.05, min(0.95, win_prob + adj))
+    return round(win_prob, 4)
 
 
-def _score_leg(
-    implied: float,
-    win_prob: float,
-    confidence: float,
-    profile: dict,
-    *,
-    favorite: bool,
-) -> float:
-    price_score = 1 - abs(implied - profile["target_implied"]) * profile["price_weight"]
-    edge = (win_prob - implied) * profile["context_weight"] * 3
-    conf_bonus = confidence * 0.25
-    fav_penalty = -0.06 if favorite and implied > 0.65 else 0
-    return round(price_score + edge + conf_bonus + fav_penalty, 4)
-
-
-def _rationale(team: str, ctx: Dict, label: str, win_prob: float, implied: float) -> str:
-    parts = [f"{label} on {team}."]
-    edge = win_prob - implied
-    if edge > 0.03:
-        parts.append(f"Model win rate ~{win_prob:.0%} vs {implied:.0%} implied (+{edge:.0%} edge).")
-    if ctx.get("line_move", 0) > 0.02:
-        parts.append("Sharp line movement supports this side.")
-    if ctx.get("injury_penalty_home", 0) > 0.05 or ctx.get("injury_penalty_away", 0) > 0.05:
-        parts.append("Injury report tilts the matchup.")
-    if ctx.get("news_sentiment", 0) > 0.02:
-        parts.append("Recent news flow is favorable.")
-    elif ctx.get("news_sentiment", 0) < -0.02:
-        parts.append("News headwinds priced into the other side.")
-    return " ".join(parts)
-
-
-def _total_rationale(game: GameSummary, ctx: Dict, side: str, win_prob: float) -> str:
-    if side == "over" and ctx.get("weather_factor", 0) > 0.02:
-        return f"Weather favors scoring; Over {game.total} (~{win_prob:.0%} model win rate)."
-    if side == "under" and ctx.get("weather_factor", 0) < -0.02:
-        return f"Wind/weather suppresses scoring; Under {game.total} (~{win_prob:.0%} model win rate)."
-    return f"Matchup + market price favor {side} {game.total} (~{win_prob:.0%} model win rate)."
+def _score(win_prob: float, edge: float, confidence: float, profile: dict, bonus: float = 0.0) -> float:
+    return round(
+        win_prob * profile["w_win"] + edge * profile["w_edge"] + confidence * 0.3 + bonus, 4
+    )
 
 
 async def _candidate_legs(game: GameSummary, profile: dict, risk: RiskLevel) -> List[dict]:
     ctx = await get_game_context(game)
-    legs: List[dict] = []
     matchup = f"{game.away_team} @ {game.home_team}"
+    home_win_prob: Optional[float] = ctx.get("home_win_prob")
+    expected_margin = float(ctx.get("expected_margin", 0.0))
+    projected_total = ctx.get("projected_total")
+    model_source = ctx.get("model_source", "market_fallback")
+    legs: List[dict] = []
 
-    def maybe_add(**kwargs):
-        implied = kwargs["implied_prob"]
-        if implied < profile["min_leg_implied"] or implied > profile["max_leg_implied"]:
-            return
-        legs.append(kwargs)
+    async def add(market: str, selection: str, odds: int, win_prob: float, *, bonus=0.0, rationale="", extra_conf=0.0, **kw):
+        implied = american_to_implied(odds)
+        win_prob = await _maybe_calibrate(win_prob, game.sport, market, risk)
+        edge = round(win_prob - implied, 4)
+        conf = _confidence(edge, model_source, extra_conf)
+        legs.append(
+            {
+                "game_id": game.id,
+                "sport": game.sport,
+                "matchup": matchup,
+                "market": market,
+                "selection": selection,
+                "odds_american": odds,
+                "implied_prob": round(implied, 4),
+                "win_probability": win_prob,
+                "confidence": conf,
+                "edge": edge,
+                "model_source": model_source,
+                "score": _score(win_prob, edge, conf, profile, bonus),
+                "rationale": rationale or _edge_rationale(selection, win_prob, implied, ctx),
+                **kw,
+            }
+        )
 
+    # Moneyline
     if game.moneyline_home is not None:
-        imp = american_to_implied(game.moneyline_home)
-        win_prob, confidence = await _win_probability_calibrated(
-            imp, ctx, home_side=True, market="moneyline", sport=game.sport, risk=risk
-        )
-        maybe_add(
-            game_id=game.id,
-            sport=game.sport,
-            matchup=matchup,
-            market="moneyline",
-            selection=game.home_team,
-            odds_american=game.moneyline_home,
-            implied_prob=imp,
-            win_probability=win_prob,
-            confidence=confidence,
-            score=_score_leg(imp, win_prob, confidence, profile, favorite=imp > 0.55),
-            rationale=_rationale(game.home_team, ctx, "Home ML", win_prob, imp),
-        )
-
+        wp = home_win_prob if home_win_prob is not None else american_to_implied(game.moneyline_home)
+        await add("moneyline", game.home_team, game.moneyline_home, wp)
     if game.moneyline_away is not None:
-        imp = american_to_implied(game.moneyline_away)
-        win_prob, confidence = await _win_probability_calibrated(
-            imp, ctx, home_side=False, market="moneyline", sport=game.sport, risk=risk
-        )
-        maybe_add(
-            game_id=game.id,
-            sport=game.sport,
-            matchup=matchup,
-            market="moneyline",
-            selection=game.away_team,
-            odds_american=game.moneyline_away,
-            implied_prob=imp,
-            win_probability=win_prob,
-            confidence=confidence,
-            score=_score_leg(imp, win_prob, confidence, profile, favorite=imp > 0.55),
-            rationale=_rationale(game.away_team, ctx, "Away ML", win_prob, imp),
-        )
+        wp = (1 - home_win_prob) if home_win_prob is not None else american_to_implied(game.moneyline_away)
+        await add("moneyline", game.away_team, game.moneyline_away, wp)
 
+    # Spread
     if game.spread_home is not None:
-        for side, odds, selection, home_side in (
-            ("home", game.spread_home_odds, f"{game.home_team} {game.spread_home:+.1f}", True),
-            ("away", game.spread_away_odds, f"{game.away_team} {-game.spread_home:+.1f}", False),
+        for home_side, odds, selection in (
+            (True, game.spread_home_odds, f"{game.home_team} {game.spread_home:+.1f}"),
+            (False, game.spread_away_odds, f"{game.away_team} {-game.spread_home:+.1f}"),
         ):
-            imp = american_to_implied(odds)
-            win_prob, confidence = await _win_probability_calibrated(
-                imp, ctx, home_side=home_side, market="spread", sport=game.sport, risk=risk
-            )
-            maybe_add(
-                game_id=game.id,
-                sport=game.sport,
-                matchup=matchup,
-                market="spread",
-                selection=selection,
-                odds_american=odds,
-                implied_prob=imp,
-                win_probability=win_prob,
-                confidence=confidence,
-                score=_score_leg(imp, win_prob, confidence, profile, favorite=False) + 0.03,
-                rationale=f"Spread value on {selection}; model ~{win_prob:.0%} cover probability.",
-            )
+            if home_win_prob is not None:
+                wp = power_model.spread_cover_prob(
+                    game.sport, expected_margin, game.spread_home, home_side=home_side
+                )
+            else:
+                wp = american_to_implied(odds)
+            await add("spread", selection, odds, wp, bonus=0.02)
 
+    # Total
     if game.total is not None:
-        weather = ctx.get("weather_factor", 0.0)
-        over_first = weather >= 0
-        sides = [
+        lean = ctx.get("total_lean", "neutral")
+        total_conf = float(ctx.get("total_confidence", 0.0))
+        for side, odds, selection in (
             ("over", game.over_odds, f"Over {game.total}"),
             ("under", game.under_odds, f"Under {game.total}"),
-        ]
-        if not over_first:
-            sides.reverse()
-        for side, odds, selection in sides:
-            imp = american_to_implied(odds)
-            win_prob, confidence = await _win_probability_calibrated(
-                imp, ctx, home_side=True, market="total", sport=game.sport, risk=risk
-            )
-            maybe_add(
-                game_id=game.id,
-                sport=game.sport,
-                matchup=matchup,
-                market="total",
-                selection=selection,
-                odds_american=odds,
-                implied_prob=imp,
-                win_probability=win_prob,
-                confidence=confidence,
-                score=_score_leg(imp, win_prob, confidence, profile, favorite=False),
-                rationale=_total_rationale(game, ctx, side, win_prob),
-            )
+        ):
+            if projected_total is not None:
+                over_p = power_model.over_prob(game.sport, projected_total, game.total)
+                wp = over_p if side == "over" else 1 - over_p
+            else:
+                wp = american_to_implied(odds)
+            extra = 0.1 if lean == side and total_conf > 0.4 else 0.0
+            await add("total", selection, odds, wp, extra_conf=extra)
 
     return legs
+
+
+def _edge_rationale(selection: str, win_prob: float, implied: float, ctx: dict) -> str:
+    edge = win_prob - implied
+    parts = [f"{selection}: model {win_prob:.0%} vs market {implied:.0%}"]
+    if edge > 0.02:
+        parts.append(f"(+{edge:.0%} edge).")
+    elif edge < -0.02:
+        parts.append(f"({edge:.0%} vs market — thin).")
+    else:
+        parts.append("(in line with market).")
+    factors = ctx.get("key_factors") or []
+    if factors:
+        parts.append(factors[0] + ".")
+    if ctx.get("model_source") == "market_fallback":
+        parts.append("No team stats available — anchored to market.")
+    return " ".join(parts)
 
 
 def _best_per_game(candidates: List[dict]) -> List[dict]:
@@ -285,98 +196,137 @@ def _parlay_metrics(legs: List[dict]) -> Tuple[int, float, float]:
 
 def _select_parlay(candidates: List[dict], leg_count: int, risk: RiskLevel) -> List[dict]:
     profile = RISK_PROFILES[risk]
-    pool = sorted(_best_per_game(candidates), key=lambda x: (x["score"], x["win_probability"]), reverse=True)
+    pool = _best_per_game(candidates)
+    # Prefer legs meeting the risk floor; keep the rest as fallback.
+    eligible = [c for c in pool if c["win_probability"] >= profile["min_leg_win"]]
+    ranked = sorted(eligible or pool, key=lambda x: (x["score"], x["win_probability"]), reverse=True)
 
-    if len(pool) < leg_count:
-        leg_count = len(pool)
+    leg_count = min(leg_count, len(ranked))
     if leg_count < 2:
         raise ValueError("Not enough quality legs today — try another sport or check back later")
 
-    top = pool[: min(len(pool), leg_count + 4)]
-    best_combo: List[dict] = []
-    best_key = (-1.0, -1.0, -1)
-
-    for combo in itertools.combinations(top, leg_count):
-        combined_american, combined_implied, win_prob = _parlay_metrics(list(combo))
-        if combined_american < profile["min_combined_american"]:
-            continue
-        if combined_implied > profile["max_combined_implied"]:
-            continue
-        if win_prob < profile["min_win_prob"]:
-            continue
-        avg_conf = sum(c["confidence"] for c in combo) / len(combo)
-        key = (win_prob, avg_conf, combined_american)
-        if key > best_key:
-            best_key = key
-            best_combo = list(combo)
-
-    if best_combo:
-        return best_combo
-
-    # Relax payout floor slightly but still maximize win probability
-    fallback_key = (-1.0, -1.0)
-    fallback: List[dict] = []
-    for combo in itertools.combinations(top, leg_count):
-        combined_american, combined_implied, win_prob = _parlay_metrics(list(combo))
-        if combined_implied > profile["max_combined_implied"] * 1.15:
-            continue
-        key = (win_prob, combined_american)
-        if key > fallback_key:
-            fallback_key = key
-            fallback = list(combo)
-
-    if fallback:
-        return fallback
-
-    # Last resort: highest win-prob legs from distinct games
-    head = pool[0]
-    tail = pool[1:]
-    random.shuffle(tail)
-    return [head] + tail[: leg_count - 1]
+    chosen = ranked[:leg_count]
+    # If combined win prob is below the floor, swap in higher-prob legs.
+    _, _, win_prob = _parlay_metrics(chosen)
+    if win_prob < profile["min_combined_win"] and len(ranked) > leg_count:
+        by_win = sorted(ranked, key=lambda x: x["win_probability"], reverse=True)
+        chosen = by_win[:leg_count]
+    return chosen
 
 
-SGP_PAYOUT_FLOOR: Dict[RiskLevel, int] = {"safe": 140, "balanced": 200, "bold": 280}
+SGP_MIN_LEGS = 2
 
 
-def _sgp_profile(profile: dict) -> dict:
-    """Wider leg window for same-game legs (spreads/totals are usually -110)."""
-    return {
-        **profile,
-        "min_leg_implied": 0.38,
-        "max_leg_implied": 0.68,
-    }
+def _sgp_combo_is_valid(combo: List[dict]) -> bool:
+    """Reject same-game combos with conflicting legs (both sides or impossible margins)."""
+    ml_count = 0
+    spread_count = 0
+    has_over = False
+    has_under = False
+
+    for leg in combo:
+        market = leg.get("market", "")
+        sel = leg.get("selection", "").lower()
+        if market == "moneyline":
+            ml_count += 1
+            if ml_count > 1:
+                return False
+        elif market == "spread":
+            spread_count += 1
+            if spread_count > 1:
+                return False
+        elif market == "total":
+            if sel.startswith("over"):
+                if has_over or has_under:
+                    return False
+                has_over = True
+            elif sel.startswith("under"):
+                if has_over or has_under:
+                    return False
+                has_under = True
+
+    if not combo:
+        return True
+
+    matchup = combo[0].get("matchup", "")
+    home_team, away_team = parse_matchup(matchup)
+    if not home_team:
+        return True
+
+    # Books disallow ML + spread on the same team (correlated / dependent legs)
+    ml_side: Optional[str] = None
+    spread_side: Optional[str] = None
+    for leg in combo:
+        if leg.get("market") == "moneyline":
+            if team_match(leg.get("selection", ""), home_team):
+                ml_side = "home"
+            elif team_match(leg.get("selection", ""), away_team):
+                ml_side = "away"
+        elif leg.get("market") == "spread":
+            try:
+                team, _ = parse_spread(leg.get("selection", ""))
+                if team_match(team, home_team):
+                    spread_side = "home"
+                elif team_match(team, away_team):
+                    spread_side = "away"
+            except ValueError:
+                return False
+    if ml_side and spread_side and ml_side == spread_side:
+        return False
+
+    from app.services.settlement import grade_moneyline, grade_spread, grade_total
+
+    for margin in range(-25, 26):
+        home_score = 110 + max(margin, 0)
+        away_score = 110 + max(-margin, 0)
+        all_win = True
+        for leg in combo:
+            market = leg.get("market", "")
+            try:
+                if market == "moneyline":
+                    result = grade_moneyline(leg["selection"], home_team, away_team, home_score, away_score)
+                elif market == "spread":
+                    result = grade_spread(leg["selection"], home_team, away_team, home_score, away_score)
+                elif market == "total":
+                    result = grade_total(leg["selection"], home_score, away_score)
+                else:
+                    continue
+                if result != "win":
+                    all_win = False
+                    break
+            except ValueError:
+                all_win = False
+                break
+        if all_win:
+            return True
+    return False
 
 
 def _select_same_game_parlay(candidates: List[dict], leg_count: int, risk: RiskLevel) -> List[dict]:
-    profile = RISK_PROFILES[risk]
     pool = sorted(candidates, key=lambda x: (x["score"], x["win_probability"]), reverse=True)
     if len(pool) < 2:
         raise ValueError("Not enough markets for a same-game parlay on this matchup")
 
-    leg_count = min(leg_count, len(pool))
+    leg_count = min(leg_count, 3, len(pool))
 
-    # Prefer best leg per market (ML, spread, total) for variety
     by_market: Dict[str, dict] = {}
     for c in pool:
         if c["market"] not in by_market:
             by_market[c["market"]] = c
-    diverse = sorted(
-        by_market.values(),
-        key=lambda x: (x["score"], x["win_probability"]),
-        reverse=True,
-    )
+    diverse = sorted(by_market.values(), key=lambda x: (x["score"], x["win_probability"]), reverse=True)
 
     best_combo: List[dict] = []
     best_key = (-1.0, -1.0)
     search_pool = pool if len(pool) <= 6 else diverse + [c for c in pool if c not in diverse]
 
     for combo in itertools.combinations(search_pool, leg_count):
+        if not _sgp_combo_is_valid(combo):
+            continue
         markets = [c["market"] for c in combo]
         variety_bonus = len(set(markets)) * 0.02
-        combined_american, combined_implied, win_prob = _parlay_metrics(list(combo))
-        if combined_american < SGP_PAYOUT_FLOOR[risk]:
-            continue
-        key = (win_prob + variety_bonus, combined_american)
+        _, _, win_prob = _parlay_metrics(list(combo))
+        avg_edge = sum(c["edge"] for c in combo) / len(combo)
+        key = (win_prob + variety_bonus + avg_edge, win_prob)
         if key > best_key:
             best_key = key
             best_combo = list(combo)
@@ -384,11 +334,41 @@ def _select_same_game_parlay(candidates: List[dict], leg_count: int, risk: RiskL
     if best_combo:
         return best_combo
 
-    return diverse[:leg_count] if len(diverse) >= leg_count else pool[:leg_count]
+    if len(diverse) >= leg_count and _sgp_combo_is_valid(diverse[:leg_count]):
+        return diverse[:leg_count]
+
+    chosen: List[dict] = []
+    for c in pool:
+        if len(chosen) >= leg_count:
+            break
+        if _sgp_combo_is_valid(chosen + [c]):
+            chosen.append(c)
+    if len(chosen) >= 2:
+        return chosen
+
+    raise ValueError("Could not build a valid same-game parlay — try 2 or 3 legs (ML, spread, total only)")
+
+
+async def _collect_anchors(games: List[GameSummary], used_keys: set) -> List[PickLeg]:
+    if not settings.enable_player_props:
+        return []
+    anchors: List[dict] = []
+    for game in games:
+        ctx = await get_game_context(game)
+        for leg in await props.suggest_prop_anchors(game, ctx):
+            key = (leg["game_id"], leg.get("player"), leg.get("stat"))
+            if key in used_keys:
+                continue
+            anchors.append(leg)
+    anchors.sort(key=lambda x: x["score"], reverse=True)
+    return [PickLeg(**a) for a in anchors[:4]]
 
 
 async def _generate_same_game_parlay(req: ParlayRequest) -> ParlayResponse:
-    profile = _sgp_profile(RISK_PROFILES[req.risk])
+    if req.legs > 3:
+        raise ValueError("Same-game parlays support at most 3 legs (one ML, spread, and total pick)")
+
+    profile = RISK_PROFILES[req.risk]
     games = await get_todays_games(req.sport)
     game = next((g for g in games if g.id == req.game_id), None)
     if not game:
@@ -396,9 +376,7 @@ async def _generate_same_game_parlay(req: ParlayRequest) -> ParlayResponse:
 
     candidates = await _candidate_legs(game, profile, req.risk)
     if len(candidates) < 2:
-        raise ValueError(
-            "This game doesn't have enough markets (need ML, spread, and/or total)"
-        )
+        raise ValueError("This game doesn't have enough markets (need ML, spread, and/or total)")
 
     chosen = _select_same_game_parlay(candidates, req.legs, req.risk)
     legs = [PickLeg(**c) for c in chosen]
@@ -406,10 +384,13 @@ async def _generate_same_game_parlay(req: ParlayRequest) -> ParlayResponse:
     matchup = f"{game.away_team} @ {game.home_team}"
 
     summary = (
-        f"{RISK_PROFILES[req.risk]['label']} {len(legs)}-leg same-game parlay on {matchup}. "
-        f"Stacks ML, spread, and total picks for this matchup (~{estimated_win_prob:.1%} est. win, "
-        f"{format(combined_american, '+d')}). Legs are correlated — higher risk than multi-game slips."
+        f"{profile['label']} {len(legs)}-leg same-game parlay on {matchup}. "
+        f"Model win ~{estimated_win_prob:.1%} ({format(combined_american, '+d')}). "
+        f"Legs are correlated — higher risk than multi-game slips."
     )
+
+    used = {(c["game_id"], c.get("player"), c.get("stat")) for c in chosen}
+    anchors = await _collect_anchors([game], used)
 
     return ParlayResponse(
         legs=legs,
@@ -420,6 +401,8 @@ async def _generate_same_game_parlay(req: ParlayRequest) -> ParlayResponse:
         risk=req.risk,
         same_game=True,
         summary=summary,
+        anchors=anchors,
+        book_check_passed=_sgp_combo_is_valid(chosen),
         generated_at=datetime.now(timezone.utc),
     )
 
@@ -439,18 +422,25 @@ async def generate_parlay(req: ParlayRequest) -> ParlayResponse:
         candidates.extend(await _candidate_legs(game, profile, req.risk))
 
     if not candidates:
-        raise ValueError("No qualifying legs for this risk level — try Balanced or another sport")
+        raise ValueError("No qualifying legs right now — try Balanced or another sport")
 
     chosen = _select_parlay(candidates, req.legs, req.risk)
     legs = [PickLeg(**c) for c in chosen]
     combined_american, combined_implied, estimated_win_prob = _parlay_metrics(chosen)
 
     sports = ", ".join(sorted({l.sport.upper() for l in legs}))
+    avg_edge = sum(c["edge"] for c in chosen) / len(chosen)
+    fallback = any(c["model_source"] == "market_fallback" for c in chosen)
     summary = (
         f"{profile['label']} {len(legs)}-leg parlay across {sports}. "
-        f"Built to maximize win probability (~{estimated_win_prob:.1%}) while targeting "
-        f"{format(combined_american, '+d')} payout — uncorrelated legs only, no same-game conflicts."
+        f"Model win ~{estimated_win_prob:.1%}, avg edge {avg_edge:+.1%} vs market "
+        f"({format(combined_american, '+d')}). Uncorrelated legs, one per game."
+        + (" Some legs lack team stats and are anchored to the market." if fallback else "")
     )
+
+    chosen_games = {l.game_id: g for g in games for l in legs if g.id == l.game_id}
+    used = {(c["game_id"], c.get("player"), c.get("stat")) for c in chosen}
+    anchors = await _collect_anchors(list(chosen_games.values()), used)
 
     response = ParlayResponse(
         legs=legs,
@@ -461,11 +451,12 @@ async def generate_parlay(req: ParlayRequest) -> ParlayResponse:
         risk=req.risk,
         same_game=False,
         summary=summary,
+        anchors=anchors,
+        book_check_passed=True,
         generated_at=datetime.now(timezone.utc),
     )
 
     insight = await explain_parlay(response)
     if insight:
         response.ai_insight = insight
-
     return response

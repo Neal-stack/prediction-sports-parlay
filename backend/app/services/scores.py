@@ -9,6 +9,7 @@ import httpx
 from app.config import settings
 from app.db.async_db import run_sync
 from app.db.supabase import get_supabase
+from app.services import espn
 from app.services.demo_data import demo_final_scores
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,14 @@ async def _lookup_score_from_api(
     away_team: str,
     start_time: datetime,
 ) -> Tuple[Optional[int], Optional[int], str]:
+    # Primary: ESPN scoreboard (free, no key, one call/day cached).
+    result = await espn.find_game_result(sport, home_team, away_team, start_time)
+    if result:
+        return result["home_score"], result["away_score"], result["game_status"]
+
+    # Fallback: API-Sports, only if a key is configured.
+    if not settings.api_sports_key:
+        return None, None, "scheduled"
     for offset in (0, -1):
         day = (start_time + timedelta(days=offset)).strftime("%Y-%m-%d")
         games = await _fetch_api_sports_games(sport, day)
@@ -137,6 +146,8 @@ async def get_game_result(game_id: str) -> Optional[dict]:
             "home_score": row["home_score"],
             "away_score": row["away_score"],
             "game_status": "final",
+            "start_time": row.get("start_time"),
+            "sport": row.get("sport"),
             "score_display": f"{row['away_team']} {row['away_score']} @ {row['home_team']} {row['home_score']}",
         }
 
@@ -177,6 +188,8 @@ async def get_game_result(game_id: str) -> Optional[dict]:
         "home_score": home_score,
         "away_score": away_score,
         "game_status": status,
+        "start_time": start_time,
+        "sport": sport,
         "score_display": f"{away_team} {away_score} @ {home_team} {home_score}",
     }
 

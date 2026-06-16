@@ -1,0 +1,39 @@
+# Render blueprint for the FastAPI backend (free tier).
+# Frontend deploys separately on Vercel (see README "Deploy").
+#
+# Free instances spin down after ~15 min idle: the first request after a nap
+# is slow and the background odds scheduler pauses while asleep, but the app
+# still serves live data via on-demand ESPN fetches. Secrets (sync: false) are
+# entered in the Render dashboard, never committed.
+services:
+  - type: web
+    name: prediction-parlay-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: USE_DEMO_DATA
+        value: "false"
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+      - key: ODDS_SYNC_MINUTES
+        value: "15"
+      - key: RESEARCH_TTL_MINUTES
+        value: "30"
+      # --- Secrets: set these in the Render dashboard (Environment tab) ---
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      # Set to your Vercel URL(s) after the frontend deploys, comma-separated.
+      - key: CORS_ORIGINS
+        sync: false

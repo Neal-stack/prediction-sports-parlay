@@ -16,6 +16,7 @@ import {
   type RiskLevel,
   type StatusResponse,
 } from "@/lib/api";
+import { addLegToParlay } from "@/lib/tracker";
 
 const SPORTS = [
   { value: "", label: "All sports" },
@@ -70,6 +71,12 @@ export default function Home() {
   }, [sport, parlayMode]);
 
   useEffect(() => {
+    if (parlayMode === "same-game" && legCount > 3) {
+      setLegCount(3);
+    }
+  }, [parlayMode, legCount]);
+
+  useEffect(() => {
     loadStatus();
   }, [loadStatus]);
 
@@ -96,9 +103,12 @@ export default function Home() {
     }
   }
 
-  const live = status && !status.demo_mode && status.sharpapi;
-  const sameGameGames =
-    parlayMode === "same-game" ? games : games;
+  const live =
+    status &&
+    !status.demo_mode &&
+    status.games_source != null &&
+    !["none", "demo"].includes(status.games_source);
+  const sameGameGames = games;
 
   return (
     <main className="flex flex-1 flex-col items-center px-4 py-12 sm:py-16">
@@ -111,16 +121,30 @@ export default function Home() {
           level.
         </p>
         {status && (
-          <p className="mt-2 text-xs text-zinc-600">
-            {live
-              ? `Live · ${status.games_cached} games · ${status.games_source ?? "unknown"}`
-              : "Check backend/.env for live data"}
-            {status.ai_provider
-              ? ` · AI: ${status.ai_provider}`
-              : " · AI offline"}
+          <p className="mt-2 flex flex-wrap items-center justify-center gap-x-1 text-xs text-zinc-600">
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${
+                status.demo_mode
+                  ? "bg-amber-500"
+                  : live
+                    ? "bg-emerald-500"
+                    : "bg-red-500"
+              }`}
+              aria-hidden
+            />
+            {status.demo_mode
+              ? "Demo data"
+              : live
+                ? `Live · ${status.games_cached} games · ${status.games_source ?? "unknown"}`
+                : "No live games — check backend/.env"}
+            {status.ai_provider ? ` · AI: ${status.ai_provider}` : " · AI offline"}
+            {status.player_props ? " · props on" : ""}
             {status.tracking_enabled ? " · tracking on" : ""}
             {status.calibration_samples
               ? ` · ${status.calibration_samples} calibration legs`
+              : ""}
+            {status.odds_requests_remaining != null
+              ? ` · ${status.odds_requests_remaining} odds credits left`
               : ""}
           </p>
         )}
@@ -200,7 +224,7 @@ export default function Home() {
             onChange={(e) => setLegCount(Number(e.target.value))}
             className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500/50"
           >
-            {[2, 3, 4, 5].map((n) => (
+            {(parlayMode === "same-game" ? [2, 3] : [2, 3, 4, 5]).map((n) => (
               <option key={n} value={n}>
                 {n}
               </option>
@@ -267,7 +291,10 @@ export default function Home() {
 
         {parlay && (
           <div className="flex w-full max-w-lg flex-col items-center gap-6">
-            <ParlayCard parlay={parlay} />
+            <ParlayCard
+              parlay={parlay}
+              onAddAnchor={(leg) => setParlay((p) => (p ? addLegToParlay(p, leg) : p))}
+            />
             <EdgePanel parlay={parlay} />
             <ParlayTrackerPanel
               parlay={parlay}

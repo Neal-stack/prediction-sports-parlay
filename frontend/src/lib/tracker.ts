@@ -2,6 +2,7 @@ import type {
   LegOutcome,
   ParlayResponse,
   PerformanceStats,
+  PickLeg,
   RiskLevel,
   SavedParlayRecord,
 } from "./api";
@@ -9,6 +10,36 @@ import { getSessionId } from "./session";
 
 const STORAGE_KEY = "parlay-tracker-v2";
 const MAX_SAVED = 30;
+
+function legDecimal(oddsAmerican: number): number {
+  return oddsAmerican > 0 ? 1 + oddsAmerican / 100 : 1 + 100 / Math.abs(oddsAmerican);
+}
+
+/** Append a leg (e.g. a prop anchor) and recompute combined odds + win prob,
+ *  mirroring the backend's combine_american_odds. */
+export function addLegToParlay(parlay: ParlayResponse, leg: PickLeg): ParlayResponse {
+  const legs = [...parlay.legs, leg];
+  let decimal = 1;
+  let win = 1;
+  for (const l of legs) {
+    decimal *= legDecimal(l.odds_american);
+    win *= l.win_probability;
+  }
+  const american =
+    decimal >= 2 ? Math.round((decimal - 1) * 100) : Math.round(-100 / (decimal - 1));
+  const payout = american > 0 ? american : 100 * (100 / Math.abs(american));
+  return {
+    ...parlay,
+    legs,
+    combined_american: american,
+    combined_implied_prob: Math.round((1 / decimal) * 10000) / 10000,
+    estimated_win_prob: Math.round(win * 10000) / 10000,
+    payout_on_100: Math.round(payout * 100) / 100,
+    anchors: (parlay.anchors ?? []).filter(
+      (a) => !(a.player === leg.player && a.stat === leg.stat && a.selection === leg.selection)
+    ),
+  };
+}
 
 export function potentialPayout(stake: number, combinedAmerican: number): number {
   if (combinedAmerican > 0) {
@@ -180,6 +211,10 @@ export function applyOutcomesBatch(
   if (!updated) return next;
 
   return settleBankroll(next, updated, previousOutcome);
+}
+
+export function removeParlay(state: TrackerState, parlayId: string): TrackerState {
+  return { ...state, parlays: state.parlays.filter((p) => p.id !== parlayId) };
 }
 
 export type { TrackerState, RiskLevel };
