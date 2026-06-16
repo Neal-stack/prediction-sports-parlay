@@ -6,6 +6,7 @@ supabase==2.11.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
 apscheduler==3.10.4
+tzlocal==5.2  # explicit (apscheduler dep) — avoids transitive-only install gaps on Render
 slowapi==0.1.9
 pytest==8.3.4
 pytest-asyncio==0.25.0
