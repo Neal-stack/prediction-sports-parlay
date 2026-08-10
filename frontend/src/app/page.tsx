@@ -20,6 +20,7 @@ import { addLegToParlay } from "@/lib/tracker";
 
 const SPORTS = [
   { value: "", label: "All sports" },
+  { value: "wc", label: "World Cup" },
   { value: "nba", label: "NBA" },
   { value: "nfl", label: "NFL" },
   { value: "mlb", label: "MLB" },
@@ -35,7 +36,9 @@ export default function Home() {
   const [legCount, setLegCount] = useState(3);
   const [risk, setRisk] = useState<RiskLevel>("balanced");
   const [sport, setSport] = useState("");
-  const [parlayMode, setParlayMode] = useState<"multi" | "same-game">("multi");
+  const [parlayMode, setParlayMode] = useState<"multi" | "same-game" | "props">(
+    "multi"
+  );
   const [games, setGames] = useState<GameSummary[]>([]);
   const [gamesLoading, setGamesLoading] = useState(true);
   const [gamesError, setGamesError] = useState<string | null>(null);
@@ -52,7 +55,12 @@ export default function Home() {
   const loadGames = useCallback(() => {
     setGamesLoading(true);
     setGamesError(null);
-    const filter = parlayMode === "same-game" ? sport || "nba" : sport || undefined;
+    const filter =
+      parlayMode === "props"
+        ? "nba"
+        : parlayMode === "same-game"
+          ? sport || "nba"
+          : sport || undefined;
     fetchGames(filter)
       .then((list) => {
         setGames(list);
@@ -90,9 +98,15 @@ export default function Home() {
     try {
       const result = await generateParlay({
         legs: legCount,
-        sport: parlayMode === "same-game" ? sport || "nba" : sport || null,
+        sport:
+          parlayMode === "props"
+            ? "nba"
+            : parlayMode === "same-game"
+              ? sport || "nba"
+              : sport || null,
         risk,
         game_id: parlayMode === "same-game" ? gameId : null,
+        mode: parlayMode === "props" ? "props" : "standard",
       });
       setParlay(result);
     } catch (e) {
@@ -169,12 +183,13 @@ export default function Home() {
             id="mode"
             value={parlayMode}
             onChange={(e) =>
-              setParlayMode(e.target.value as "multi" | "same-game")
+              setParlayMode(e.target.value as "multi" | "same-game" | "props")
             }
             className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500/50"
           >
             <option value="multi">Multi-game</option>
             <option value="same-game">Same-game (SGP)</option>
+            <option value="props">Player props (NBA)</option>
           </select>
         </div>
 
@@ -202,9 +217,10 @@ export default function Home() {
           </label>
           <select
             id="sport"
-            value={sport}
+            value={parlayMode === "props" ? "nba" : sport}
             onChange={(e) => setSport(e.target.value)}
-            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500/50"
+            disabled={parlayMode === "props"}
+            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500/50 disabled:opacity-50"
           >
             {SPORTS.map((s) => (
               <option key={s.value || "all"} value={s.value}>
@@ -262,7 +278,9 @@ export default function Home() {
       <p className="mb-6 max-w-md text-center text-xs text-zinc-600">
         {parlayMode === "same-game"
           ? "Same-game legs are correlated — higher payout, harder to hit."
-          : RISK_OPTIONS.find((o) => o.value === risk)?.hint}
+          : parlayMode === "props"
+            ? "Stacks player stat overs at alt lines (Safe ≈ 80% legs, Balanced ≈ 70%, Bold ≈ 60%). Lines are model-derived — confirm at your book."
+            : RISK_OPTIONS.find((o) => o.value === risk)?.hint}
       </p>
 
       <button

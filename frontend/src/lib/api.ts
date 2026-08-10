@@ -170,11 +170,14 @@ export async function fetchStatus(): Promise<StatusResponse> {
   return res.json();
 }
 
+export type ParlayMode = "standard" | "props";
+
 export async function generateParlay(opts?: {
   legs?: number;
   sport?: string | null;
   risk?: RiskLevel;
   game_id?: string | null;
+  mode?: ParlayMode;
 }): Promise<ParlayResponse> {
   const res = await fetch(`${API_BASE}/api/parlay/generate`, {
     method: "POST",
@@ -184,6 +187,7 @@ export async function generateParlay(opts?: {
       sport: opts?.sport ?? null,
       risk: opts?.risk ?? "balanced",
       game_id: opts?.game_id ?? null,
+      mode: opts?.mode ?? "standard",
     }),
   });
   if (!res.ok) {

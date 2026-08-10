@@ -79,13 +79,16 @@ function LegRow({ leg }: { leg: PickLeg }) {
 
 export function ParlayCard({ parlay, onAddAnchor }: Props) {
   const anchors = parlay.anchors ?? [];
+  const allProps =
+    parlay.legs.length > 0 && parlay.legs.every((l) => l.market === "player_prop");
   return (
     <div className="w-full max-w-lg animate-in fade-in slide-in-from-bottom-2 duration-300">
       <div className="rounded-2xl border border-emerald-500/30 bg-emerald-950/20 p-6 shadow-lg shadow-emerald-900/10">
         <div className="mb-5 flex items-baseline justify-between gap-4">
           <div>
             <p className="text-xs font-medium uppercase tracking-widest text-emerald-400/80">
-              {riskLabel[parlay.risk]} {parlay.same_game ? "same-game" : ""} parlay
+              {riskLabel[parlay.risk]}{" "}
+              {allProps ? "player-prop" : parlay.same_game ? "same-game" : ""} parlay
             </p>
             <p className="mt-1 text-2xl font-semibold text-white">
               {parlay.legs.length} legs · {formatAmerican(parlay.combined_american)}

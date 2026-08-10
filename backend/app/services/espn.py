@@ -24,13 +24,32 @@ SPORT_PATHS: Dict[str, Tuple[str, str]] = {
     "nfl": ("football", "nfl"),
     "mlb": ("baseball", "mlb"),
     "nhl": ("hockey", "nhl"),
+    "wc": ("soccer", "fifa.world"),  # FIFA World Cup
 }
+
+# Sports with a 3-way result (win/draw/loss) instead of 2-way.
+SOCCER_SPORTS = {"wc"}
 
 SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports"
 STANDINGS_BASE = "https://site.api.espn.com/apis/v2/sports"
 
 FINAL_STATES = {"post"}
-OUTDOOR_SPORTS = {"nfl", "mlb"}
+OUTDOOR_SPORTS = {"nfl", "mlb", "wc"}
+
+
+def is_soccer(sport: str) -> bool:
+    return sport.lower() in SOCCER_SPORTS
+
+
+def _implied_from_american(american: int) -> float:
+    return abs(american) / (abs(american) + 100) if american < 0 else 100 / (american + 100)
+
+
+def _american_from_implied(implied: float) -> int:
+    implied = max(0.02, min(0.95, implied))
+    if implied >= 0.5:
+        return -int(round(implied / (1 - implied) * 100))
+    return int(round((1 - implied) / implied * 100))
 
 _cache: Dict[str, Any] = {}
 _cache_ts: Dict[str, datetime] = {}
@@ -150,6 +169,7 @@ def _parse_float(value: Any) -> Optional[float]:
 
 def _best_odds_block(odds: List[dict]) -> Optional[dict]:
     """Pick the highest-priority odds provider that has usable numbers."""
+    odds = [o for o in (odds or []) if isinstance(o, dict)]
     if not odds:
         return None
     ranked = sorted(odds, key=lambda o: (o.get("provider") or {}).get("priority", 99))
@@ -190,12 +210,15 @@ async def fetch_odds_events(sport: str, date: Optional[datetime] = None) -> List
         comp = comps[0]
         competitors = comp.get("competitors") or []
         home = away = None
+        home_abbr = away_abbr = ""
         for c in competitors:
-            name = (c.get("team") or {}).get("displayName") or ""
+            team = c.get("team") or {}
+            name = team.get("displayName") or ""
+            abbr = team.get("abbreviation") or ""
             if c.get("homeAway") == "home":
-                home = name
+                home, home_abbr = name, abbr
             elif c.get("homeAway") == "away":
-                away = name
+                away, away_abbr = name, abbr
         if not home or not away:
             continue
 
@@ -213,6 +236,7 @@ async def fetch_odds_events(sport: str, date: Optional[datetime] = None) -> List
             "is_outdoor": is_outdoor,
             "moneyline_home": None,
             "moneyline_away": None,
+            "draw_odds": None,
             "spread_home": None,
             "spread_home_odds": -110,
             "spread_away_odds": -110,
@@ -223,18 +247,64 @@ async def fetch_odds_events(sport: str, date: Optional[datetime] = None) -> List
 
         block = _best_odds_block(comp.get("odds") or [])
         if block:
-            home_odds = block.get("homeTeamOdds") or {}
-            away_odds = block.get("awayTeamOdds") or {}
-            ev["moneyline_home"] = _parse_int(home_odds.get("moneyLine"))
-            ev["moneyline_away"] = _parse_int(away_odds.get("moneyLine"))
-            ev["spread_home"] = _parse_float(block.get("spread"))
-            ev["spread_home_odds"] = _parse_int(home_odds.get("spreadOdds")) or -110
-            ev["spread_away_odds"] = _parse_int(away_odds.get("spreadOdds")) or -110
-            ev["total"] = _parse_float(block.get("overUnder"))
+            if is_soccer(sport):
+                _fill_soccer_odds(ev, block, home_abbr, away_abbr)
+            else:
+                home_odds = block.get("homeTeamOdds") or {}
+                away_odds = block.get("awayTeamOdds") or {}
+                ev["moneyline_home"] = _parse_int(home_odds.get("moneyLine"))
+                ev["moneyline_away"] = _parse_int(away_odds.get("moneyLine"))
+                ev["spread_home"] = _parse_float(block.get("spread"))
+                ev["spread_home_odds"] = _parse_int(home_odds.get("spreadOdds")) or -110
+                ev["spread_away_odds"] = _parse_int(away_odds.get("spreadOdds")) or -110
+                ev["total"] = _parse_float(block.get("overUnder"))
 
-        if ev["moneyline_home"] or ev["spread_home"] is not None or ev["total"] is not None:
+        if (
+            ev["moneyline_home"]
+            or ev["draw_odds"]
+            or ev["spread_home"] is not None
+            or ev["total"] is not None
+        ):
             events.append(ev)
     return events
+
+
+def _fill_soccer_odds(ev: dict, block: dict, home_abbr: str, away_abbr: str) -> None:
+    """Reconstruct 3-way prices from ESPN soccer odds.
+
+    ESPN gives the total (overUnder), the draw moneyline, and `details` like
+    "SUI -175" — the listed side's abbreviation + price. The third price is
+    derived from a typical ~7% overround so every outcome has an implied number.
+    """
+    ev["total"] = _parse_float(block.get("overUnder"))
+    draw_ml = _parse_int((block.get("drawOdds") or {}).get("moneyLine"))
+    ev["draw_odds"] = draw_ml
+
+    details = str(block.get("details") or "").strip()  # e.g. "SUI -175"
+    listed_ml = None
+    listed_side = None
+    parts = details.rsplit(" ", 1)
+    if len(parts) == 2:
+        abbr, price = parts
+        listed_ml = _parse_int(price.replace("+", ""))
+        if abbr and home_abbr and abbr.upper() == home_abbr.upper():
+            listed_side = "home"
+        elif abbr and away_abbr and abbr.upper() == away_abbr.upper():
+            listed_side = "away"
+
+    if listed_ml is not None and listed_side and draw_ml is not None:
+        if listed_side == "home":
+            ev["moneyline_home"] = listed_ml
+        else:
+            ev["moneyline_away"] = listed_ml
+        # Derive the missing side from a ~7% overround.
+        known = _implied_from_american(listed_ml) + _implied_from_american(draw_ml)
+        other_implied = max(0.05, 1.07 - known)
+        other_ml = _american_from_implied(other_implied)
+        if listed_side == "home":
+            ev["moneyline_away"] = other_ml
+        else:
+            ev["moneyline_home"] = other_ml
 
 
 LEADER_STAT = {

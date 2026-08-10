@@ -46,9 +46,14 @@ def grade_moneyline(
     away_team: str,
     home_score: int,
     away_score: int,
+    *,
+    three_way: bool = False,
 ) -> LegResult:
+    # Soccer 3-way: "Draw" is a real selection and a tie is not a push.
+    if selection.strip().lower() == "draw":
+        return "win" if home_score == away_score else "loss"
     if home_score == away_score:
-        return "push"
+        return "loss" if three_way else "push"
     winner = home_team if home_score > away_score else away_team
     return "win" if team_match(selection, winner) else "loss"
 
@@ -120,6 +125,9 @@ def grade_player_prop(
     raise ValueError(f"Unknown prop side: {prop_side}")
 
 
+SOCCER_SPORTS = {"wc"}
+
+
 def grade_leg(
     *,
     market: str,
@@ -127,13 +135,17 @@ def grade_leg(
     matchup: str,
     home_score: int,
     away_score: int,
+    sport: Optional[str] = None,
 ) -> LegResult:
     home_team, away_team = parse_matchup(matchup)
     if not home_team or not away_team:
         raise ValueError(f"Invalid matchup: {matchup}")
 
+    three_way = (sport or "").lower() in SOCCER_SPORTS
     if market == "moneyline":
-        return grade_moneyline(selection, home_team, away_team, home_score, away_score)
+        return grade_moneyline(
+            selection, home_team, away_team, home_score, away_score, three_way=three_way
+        )
     if market == "spread":
         return grade_spread(selection, home_team, away_team, home_score, away_score)
     if market == "total":

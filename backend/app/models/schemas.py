@@ -35,11 +35,15 @@ class PickLeg(BaseModel):
     edge_vs_implied: Optional[float] = None
 
 
+ParlayMode = Literal["standard", "props"]
+
+
 class ParlayRequest(BaseModel):
     legs: int = Field(default=3, ge=2, le=5)
     sport: Optional[str] = None
     risk: RiskLevel = "balanced"
     game_id: Optional[str] = None  # same-game parlay when set
+    mode: ParlayMode = "standard"  # "props" = stack player-stat alt-line legs (NBA)
 
 
 class ParlayResponse(BaseModel):
@@ -75,6 +79,7 @@ class GameSummary(BaseModel):
     is_outdoor: bool = False
     moneyline_home: Optional[int] = None
     moneyline_away: Optional[int] = None
+    draw_odds: Optional[int] = None  # soccer 3-way result
     spread_home: Optional[float] = None
     spread_home_odds: int = -110
     spread_away_odds: int = -110

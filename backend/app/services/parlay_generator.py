@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import itertools
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from app.models.schemas import GameSummary, ParlayRequest, ParlayResponse, PickLeg, RiskLevel
 from app.config import settings
-from app.services import power_model, props
+from app.services import espn, power_model, props
 from app.services.ai_assistant import explain_parlay
 from app.services.calibration import calibration_adjustment, ensure_calibration_loaded
 from app.services.context import get_game_context
@@ -120,6 +121,31 @@ async def _candidate_legs(game: GameSummary, profile: dict, risk: RiskLevel) -> 
             }
         )
 
+    # Soccer: 3-way result (home / draw / away) + total goals. No spread.
+    if espn.is_soccer(game.sport):
+        draw_prob = ctx.get("draw_prob")
+        away_win_prob = ctx.get("away_win_prob")
+        over_p = ctx.get("over_prob")
+
+        def _wp(prob: Optional[float], odds: int) -> float:
+            return prob if prob is not None else american_to_implied(odds)
+
+        if game.moneyline_home is not None:
+            await add("moneyline", game.home_team, game.moneyline_home, _wp(home_win_prob, game.moneyline_home))
+        if game.draw_odds is not None:
+            await add("moneyline", "Draw", game.draw_odds, _wp(draw_prob, game.draw_odds))
+        if game.moneyline_away is not None:
+            await add("moneyline", game.away_team, game.moneyline_away, _wp(away_win_prob, game.moneyline_away))
+        if game.total is not None:
+            tc = float(ctx.get("total_confidence", 0.0)) * 0.2
+            if over_p is not None:
+                await add("total", f"Over {game.total}", game.over_odds, over_p, extra_conf=tc)
+                await add("total", f"Under {game.total}", game.under_odds, round(1 - over_p, 4), extra_conf=tc)
+            else:
+                await add("total", f"Over {game.total}", game.over_odds, american_to_implied(game.over_odds))
+                await add("total", f"Under {game.total}", game.under_odds, american_to_implied(game.under_odds))
+        return legs
+
     # Moneyline
     if game.moneyline_home is not None:
         wp = home_win_prob if home_win_prob is not None else american_to_implied(game.moneyline_home)
@@ -217,8 +243,38 @@ def _select_parlay(candidates: List[dict], leg_count: int, risk: RiskLevel) -> L
 SGP_MIN_LEGS = 2
 
 
+def _soccer_sgp_is_valid(combo: List[dict]) -> bool:
+    """Soccer same-game: at most one result (home/draw/away) and one total side.
+
+    Result + total combos (e.g. Home + Over 2.5) are allowed; two results or
+    over+under are not.
+    """
+    results = 0
+    has_over = has_under = False
+    for leg in combo:
+        market = leg.get("market", "")
+        sel = leg.get("selection", "").lower()
+        if market == "moneyline":  # home / Draw / away are mutually exclusive
+            results += 1
+            if results > 1:
+                return False
+        elif market == "total":
+            if sel.startswith("over"):
+                if has_over or has_under:
+                    return False
+                has_over = True
+            elif sel.startswith("under"):
+                if has_over or has_under:
+                    return False
+                has_under = True
+    return True
+
+
 def _sgp_combo_is_valid(combo: List[dict]) -> bool:
     """Reject same-game combos with conflicting legs (both sides or impossible margins)."""
+    if any(espn.is_soccer(leg.get("sport", "")) for leg in combo):
+        return _soccer_sgp_is_valid(combo)
+
     ml_count = 0
     spread_count = 0
     has_over = False
@@ -364,6 +420,82 @@ async def _collect_anchors(games: List[GameSummary], used_keys: set) -> List[Pic
     return [PickLeg(**a) for a in anchors[:4]]
 
 
+MAX_PROP_LEGS_PER_GAME = 2
+
+
+def _select_prop_legs(pool: List[dict], leg_count: int) -> List[dict]:
+    """Greedy pick: best score first, one leg per player, capped per game."""
+    ranked = sorted(pool, key=lambda x: (x["score"], x["win_probability"]), reverse=True)
+    chosen: List[dict] = []
+    players: set = set()
+    per_game: Dict[str, int] = {}
+    for cand in ranked:
+        if len(chosen) >= leg_count:
+            break
+        player = (cand.get("player") or "").lower()
+        if player in players:
+            continue
+        if per_game.get(cand["game_id"], 0) >= MAX_PROP_LEGS_PER_GAME:
+            continue
+        players.add(player)
+        per_game[cand["game_id"]] = per_game.get(cand["game_id"], 0) + 1
+        chosen.append(cand)
+    return chosen
+
+
+async def _generate_props_parlay(req: ParlayRequest) -> ParlayResponse:
+    if not settings.enable_player_props:
+        raise ValueError("Player props are disabled — set ENABLE_PLAYER_PROPS=true")
+    if req.sport and req.sport.lower() != "nba":
+        raise ValueError("Player-prop parlays are NBA-only for now — pick NBA")
+
+    profile = RISK_PROFILES[req.risk]
+    games = await get_todays_games("nba")
+    if req.game_id:
+        games = [g for g in games if g.id == req.game_id] or games
+    if not games:
+        raise ValueError("No NBA games on the board — check back on a game day")
+
+    async def _cands(game: GameSummary) -> List[dict]:
+        ctx = await get_game_context(game)
+        return await props.prop_parlay_candidates(game, ctx, risk=req.risk)
+
+    results = await asyncio.gather(*(_cands(g) for g in games[:12]), return_exceptions=True)
+    pool = [leg for r in results if isinstance(r, list) for leg in r]
+    if not pool:
+        raise ValueError(
+            "No qualifying player props today — player averages may be unavailable (offseason?)"
+        )
+
+    chosen = _select_prop_legs(pool, req.legs)
+    if len(chosen) < 2:
+        raise ValueError("Not enough qualifying prop legs — try Balanced/Bold or fewer legs")
+
+    legs = [PickLeg(**c) for c in chosen]
+    combined_american, combined_implied, estimated_win_prob = _parlay_metrics(chosen)
+    avg_leg = sum(c["win_probability"] for c in chosen) / len(chosen)
+    summary = (
+        f"{profile['label']} {len(legs)}-leg NBA player-prop parlay — stat overs at "
+        f"alt lines the model puts at ~{avg_leg:.0%} each. Combined model win "
+        f"~{estimated_win_prob:.1%} ({format(combined_american, '+d')}). Lines and odds "
+        f"are model-derived from season averages — confirm prices at your book."
+    )
+
+    return ParlayResponse(
+        legs=legs,
+        combined_american=combined_american,
+        combined_implied_prob=round(combined_implied, 4),
+        estimated_win_prob=estimated_win_prob,
+        payout_on_100=payout_on_100(combined_american),
+        risk=req.risk,
+        same_game=len({c["game_id"] for c in chosen}) == 1,
+        summary=summary,
+        anchors=[],
+        book_check_passed=True,
+        generated_at=datetime.now(timezone.utc),
+    )
+
+
 async def _generate_same_game_parlay(req: ParlayRequest) -> ParlayResponse:
     if req.legs > 3:
         raise ValueError("Same-game parlays support at most 3 legs (one ML, spread, and total pick)")
@@ -408,6 +540,13 @@ async def _generate_same_game_parlay(req: ParlayRequest) -> ParlayResponse:
 
 
 async def generate_parlay(req: ParlayRequest) -> ParlayResponse:
+    if req.mode == "props":
+        response = await _generate_props_parlay(req)
+        insight = await explain_parlay(response)
+        if insight:
+            response.ai_insight = insight
+        return response
+
     if req.game_id:
         response = await _generate_same_game_parlay(req)
         insight = await explain_parlay(response)

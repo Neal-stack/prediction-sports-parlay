@@ -18,7 +18,7 @@ from app.models.schemas import (
     SettlementSuggestionResponse,
     SuggestSettlementRequest,
 )
-from app.services import player_stats
+from app.services import espn, player_stats, soccer_player_stats
 from app.services.calibration import compute_parlay_outcome, record_leg_outcome
 from app.services.scores import get_game_result, sync_scores_for_game_ids
 from app.services.settlement import grade_leg, grade_player_prop
@@ -247,15 +247,25 @@ async def _grade_prop_leg(index: int, leg: dict, result: dict) -> LegSettlementS
             leg_index=index, reason="Prop leg missing data — settle manually", ready=False
         )
 
-    box = await player_stats.fetch_player_box_score(
-        sport,
-        leg.get("game_id", ""),
-        result["home_team"],
-        result["away_team"],
-        _coerce_dt(result.get("start_time")),
-        player=player,
-        player_id=leg.get("player_id"),
-    )
+    if espn.is_soccer(sport):
+        box = await soccer_player_stats.fetch_player_match_stats(
+            leg.get("game_id", ""),
+            result["home_team"],
+            result["away_team"],
+            _coerce_dt(result.get("start_time")),
+            player=player,
+            player_id=leg.get("player_id"),
+        )
+    else:
+        box = await player_stats.fetch_player_box_score(
+            sport,
+            leg.get("game_id", ""),
+            result["home_team"],
+            result["away_team"],
+            _coerce_dt(result.get("start_time")),
+            player=player,
+            player_id=leg.get("player_id"),
+        )
     if not box or box.get(stat) is None:
         return LegSettlementSuggestion(
             leg_index=index,
@@ -339,6 +349,7 @@ async def suggest_settlement(body: SuggestSettlementRequest) -> SettlementSugges
                 matchup=leg.get("matchup", ""),
                 home_score=int(result["home_score"]),
                 away_score=int(result["away_score"]),
+                sport=leg.get("sport"),
             )
             suggestions.append(
                 LegSettlementSuggestion(

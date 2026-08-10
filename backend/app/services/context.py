@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 from app.config import settings
 from app.db.supabase import get_supabase
 from app.models.schemas import GameSummary
-from app.services import espn, power_model
+from app.services import espn, power_model, soccer_model
 from app.services.demo_data import CONTEXT as DEMO_CONTEXT
 from app.services.injuries import injury_context_for_teams
 from app.services.news import news_headlines_for_game
@@ -108,6 +108,9 @@ async def _build_context(game: GameSummary) -> dict:
     news = news if isinstance(news, dict) else {}
     weather = weather if isinstance(weather, dict) else None
 
+    if espn.is_soccer(game.sport):
+        return await _build_soccer_context(game, team_stats, injuries, news, line_move)
+
     # 1) Independent base win probability from team strength + rest.
     rest_adj, home_rest, away_rest = await _rest_adjustment(game)
     base_prob, base_reason, debug = power_model.base_win_probability(
@@ -160,6 +163,103 @@ async def _build_context(game: GameSummary) -> dict:
         "narrative": research.get("narrative", ""),
         "research_source": research.get("source", "none"),
     }
+
+
+def _devig_3way(game: GameSummary) -> Optional[Tuple[float, float, float]]:
+    """De-vigged (home, draw, away) market probabilities, or None if incomplete."""
+    if game.moneyline_home is None or game.moneyline_away is None or game.draw_odds is None:
+        return None
+    h = _american_to_implied(game.moneyline_home)
+    d = _american_to_implied(game.draw_odds)
+    a = _american_to_implied(game.moneyline_away)
+    total = h + d + a
+    if total <= 0:
+        return None
+    return h / total, d / total, a / total
+
+
+async def _build_soccer_context(
+    game: GameSummary, team_stats: dict, injuries: dict, news: dict, line_move: float
+) -> dict:
+    """3-way + totals probabilities from the independent Poisson model."""
+    probs = soccer_model.match_probabilities_for(game, team_stats)
+
+    research = await gemini_research(
+        game,
+        base_prob=probs.get("home_win") if probs else None,
+        projected_total=probs.get("projected_total") if probs else None,
+        injuries=injuries,
+        news=news,
+    )
+
+    ctx = _empty_context()
+    ctx.update(
+        {
+            "home_news": news.get("home_news", []),
+            "away_news": news.get("away_news", []),
+            "injuries_home": injuries.get("injuries_home", []),
+            "injuries_away": injuries.get("injuries_away", []),
+            "line_move": line_move,
+            "key_factors": research.get("key_factors", []),
+            "narrative": research.get("narrative", ""),
+            "research_source": research.get("source", "none"),
+            "is_soccer": True,
+        }
+    )
+
+    if not probs:
+        ctx["base_reason"] = "no_team_stats"
+        return ctx
+
+    home = probs["home_win"]
+    draw = probs["draw"]
+    away = probs["away_win"]
+
+    # World Cup samples are tiny (1-3 group games), so a pure goals model
+    # over-regresses to even and invents huge underdog "edges". Use the de-vigged
+    # market as a Bayesian PRIOR and weight the model by games played: early
+    # tournament leans market, later leans model. (Unlike the season sports, we
+    # don't have enough data here for the model to stand alone yet.)
+    market = _devig_3way(game)
+    if market:
+        h_stats = espn.find_team_stats(team_stats, game.home_team) or {}
+        a_stats = espn.find_team_stats(team_stats, game.away_team) or {}
+        gp = (h_stats.get("games_played", 0) or 0) + (a_stats.get("games_played", 0) or 0)
+        w_model = gp / (gp + 4)  # 1 game each -> ~0.33 model; full group -> ~0.6
+        home = w_model * home + (1 - w_model) * market[0]
+        draw = w_model * draw + (1 - w_model) * market[1]
+        away = w_model * away + (1 - w_model) * market[2]
+
+    # Apply the bounded LLM nudge to the home result, rebalancing draw/away.
+    adj = float(research.get("home_win_prob_adj", 0.0))
+    if adj:
+        new_home = max(0.02, min(0.95, home + adj))
+        rest = draw + away
+        if rest > 0:
+            scale = (1 - new_home) / rest
+            draw, away = draw * scale, away * scale
+        home = new_home
+
+    over_p = probs["over"]
+    ctx.update(
+        {
+            "base_home_win_prob": probs["home_win"],
+            "base_reason": "ok",
+            "home_win_prob": round(home, 4),
+            "draw_prob": round(draw, 4),
+            "away_win_prob": round(away, 4),
+            "over_prob": round(over_p, 4),
+            "btts_prob": probs["btts"],
+            "projected_total": probs["projected_total"],
+            "total_line": probs["total_line"],
+            "total_lean": "over" if over_p > 0.53 else "under" if over_p < 0.47 else "neutral",
+            "total_confidence": round(abs(over_p - 0.5) * 2, 3),
+            "model_source": "model",
+            "lambda_home": probs.get("lambda_home"),
+            "lambda_away": probs.get("lambda_away"),
+        }
+    )
+    return ctx
 
 
 def _empty_context() -> dict:
