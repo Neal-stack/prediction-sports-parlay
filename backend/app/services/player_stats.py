@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -268,19 +268,43 @@ _log_cache: Dict[str, Any] = {}
 _log_cache_ts: Dict[str, datetime] = {}
 
 
+def _season_type(display_name: str) -> str:
+    d = (display_name or "").lower()
+    if "postseason" in d or "playoff" in d:
+        return "post"
+    if "preseason" in d:
+        return "pre"
+    return "regular"
+
+
+def espn_season(now: Optional[datetime] = None) -> int:
+    """ESPN's season parameter: the year the season ENDS.
+
+    2025-26 is season=2026. Play starts in October, so anything from October
+    onward belongs to next year's season.
+    """
+    now = now or datetime.now(timezone.utc)
+    return now.year + 1 if now.month >= 10 else now.year
+
+
 async def player_game_log(
-    sport: str, athlete_id: str, *, limit: int = 25
+    sport: str, athlete_id: str, *, limit: int = 25, season_types: tuple = ("regular",),
+    season: Optional[int] = None,
 ) -> List[Dict[str, float]]:
     """Most-recent-first per-game stat lines for an athlete (games played only).
 
     Games with zero minutes (DNP) are excluded: whether he suits up is handled
     separately by the availability model, so counting DNPs here would penalise
     the stat distribution twice.
+
+    Only regular-season games by default. Playoff minutes, pace and defensive
+    intensity are a different distribution, and quietly blending them makes a
+    player look like someone he is not.
     """
     if sport != "nba" or not athlete_id:
         return []
 
-    key = f"{sport}:{athlete_id}:{limit}"
+    key = f"{sport}:{athlete_id}:{limit}:{'-'.join(season_types)}:{season or 'latest'}"
     ts = _log_cache_ts.get(key)
     if ts and datetime.now(timezone.utc) - ts < timedelta(hours=12):
         return _log_cache.get(key, [])
@@ -289,9 +313,10 @@ async def player_game_log(
     if not path:
         return []
     url = f"{WEB_API}/{path[0]}/{path[1]}/athletes/{athlete_id}/gamelog"
+    params = {"season": season} if season else None
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, params=params)
             if resp.status_code != 200:
                 return _log_cache.get(key, [])
             data = resp.json()
@@ -313,6 +338,9 @@ async def player_game_log(
 
     out: List[Dict[str, float]] = []
     for season in data.get("seasonTypes") or []:
+        stype = _season_type(season.get("displayName", ""))
+        if stype not in season_types:
+            continue
         for cat in season.get("categories") or []:
             for event in cat.get("events") or []:
                 row = event.get("stats") or []
@@ -322,6 +350,7 @@ async def player_game_log(
                 if minutes <= 0:  # DNP — availability model's problem, not ours
                     continue
                 line = {
+                    "season_type": stype,
                     "minutes": minutes,
                     "points": _col(row, LOG_FIELDS["points"]),
                     "rebounds": _col(row, LOG_FIELDS["rebounds"]),
@@ -344,3 +373,27 @@ async def player_game_log(
 def stat_series(log: List[Dict[str, float]], stat: str) -> List[float]:
     """Just the values for one stat, dropping games where it is missing."""
     return [g[stat] for g in log if g.get(stat) is not None]
+
+
+async def player_log_blended(
+    sport: str, athlete_id: str, *, target: int = 25, now: Optional[datetime] = None
+) -> Tuple[List[Dict[str, float]], Dict[str, int]]:
+    """Current-season log, topped up from last season when it is too thin.
+
+    Without this the engine goes silent for the first weeks of a season: the
+    thresholds want ~10 games and nobody has played 10 yet. Worse, ESPN's season
+    "averages" in week one are a two-game sample, which is noise, not a mean.
+    Prior-season games are a stale but real signal, so we fill from them and
+    report the mix rather than pretending it is all current form.
+    """
+    current = await player_game_log(sport, athlete_id, limit=target)
+    if len(current) >= target:
+        return current, {"current": len(current), "prior": 0}
+
+    prior_season = espn_season(now) - 1
+    prior = await player_game_log(
+        sport, athlete_id, limit=target - len(current), season=prior_season
+    )
+    for g in prior:
+        g["prior_season"] = True
+    return current + prior, {"current": len(current), "prior": len(prior)}

@@ -35,6 +35,9 @@ class PickLeg(BaseModel):
     availability: Optional[float] = None  # P(player suits up) haircut applied
     stat_source: Optional[str] = None  # "gamelog" | "season_avg"
     sample_games: Optional[int] = None
+    prior_season_games: Optional[int] = None  # games borrowed from last season
+    line_source: Optional[str] = None  # "book" | "model"
+    book: Optional[str] = None  # bookmaker offering the best price
     user_probability: Optional[float] = None
     edge_vs_implied: Optional[float] = None
 

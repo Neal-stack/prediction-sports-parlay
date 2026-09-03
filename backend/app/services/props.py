@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 
 from app.models.schemas import GameSummary
 from app.services import espn, player_stats, soccer_props
+from app.services.calibration import calibration_adjustment, ensure_calibration_loaded
 
 STAT_LABEL = {"points": "Points", "rebounds": "Rebounds", "assists": "Assists", "3pm": "3PM"}
 
@@ -179,6 +180,19 @@ async def _player_averages_for_angles(
     return out
 
 
+async def calibrated(win_prob: float, sport: str, risk: str) -> float:
+    """Fold in what settled prop legs have actually taught us.
+
+    Outcomes were already being recorded for props; nothing was reading them
+    back. A model that never checks its own hit rate cannot improve.
+    """
+    await ensure_calibration_loaded()
+    adj = calibration_adjustment(sport, "player_prop", risk, win_prob)
+    if adj:
+        win_prob = max(0.05, min(0.95, win_prob + adj))
+    return round(win_prob, 4)
+
+
 def empirical_prob(values: List[float], line: float, prior: float) -> float:
     """How often he ACTUALLY cleared this line, shrunk toward the model prior.
 
@@ -322,7 +336,9 @@ async def prop_parlay_candidates(game: GameSummary, ctx: dict, *, risk: str) -> 
         if availability is None:  # ruled out — never stack him
             continue
 
-        log = await player_stats.player_game_log(game.sport, str(cand.get("player_id") or ""))
+        log, mix = await player_stats.player_log_blended(
+            game.sport, str(cand.get("player_id") or "")
+        )
         series = player_stats.stat_series(log, stat)
         mean, sigma, source = distribution_for(series, season_avg, stat)
 
@@ -345,6 +361,7 @@ async def prop_parlay_candidates(game: GameSummary, ctx: dict, *, risk: str) -> 
         prior = _model_prob(target, line, stat, "over", mean)
         stat_prob = empirical_prob(series, line, prior)
         win_prob = round(min(MAX_LEG_PROB, stat_prob * availability), 4)
+        win_prob = min(MAX_LEG_PROB, await calibrated(win_prob, game.sport, risk))
         if win_prob < min_prob:
             continue
 
@@ -367,6 +384,7 @@ async def prop_parlay_candidates(game: GameSummary, ctx: dict, *, risk: str) -> 
                 "availability": round(availability, 4),
                 "stat_source": source,
                 "sample_games": len(series),
+                "prior_season_games": mix.get("prior", 0),
                 "confidence": round(min(0.9, 0.5 + conf * 0.4), 4),
                 "score": round(win_prob + conf * 0.1, 4),
                 "edge": round(win_prob - implied, 4),
@@ -380,4 +398,128 @@ async def prop_parlay_candidates(game: GameSummary, ctx: dict, *, risk: str) -> 
         )
 
     legs.sort(key=lambda x: (x["score"], x["win_probability"]), reverse=True)
+    return legs
+
+# --- Legs priced against REAL book lines --------------------------------------
+# When a book line exists we no longer set our own. The book's number becomes
+# the anchor and our only job is to disagree with it in a way we can justify.
+#
+# A large disagreement with a sharp book is almost always our data being wrong,
+# not free money: measured against the Oct 2026 opener our model said Tatum
+# under 26.5 was ~87%, because his game log was a 16-game post-Achilles rehab
+# stretch while the book was pricing a healthy player. Without this guard that
+# reads as a monster edge instead of a red flag.
+MAX_TRUSTED_DISAGREEMENT = 0.18
+MIN_BOOK_SAMPLE = 10  # games of log required before we argue with a price
+
+
+def evaluate_book_line(
+    *, model_prob: float, devig_prob: float, sample: int
+) -> dict:
+    """Measured edge against a de-vigged market price, plus whether to trust it."""
+    edge = round(model_prob - devig_prob, 4)
+    if sample < MIN_BOOK_SAMPLE:
+        return {"edge": edge, "trusted": False,
+                "reason": f"only {sample} games logged — too thin to argue with the market"}
+    if abs(edge) > MAX_TRUSTED_DISAGREEMENT:
+        return {"edge": edge, "trusted": False,
+                "reason": (f"model disagrees with the book by {abs(edge):.0%}; at that size it is "
+                           f"our data (injury, role or minutes change), not an edge")}
+    return {"edge": edge, "trusted": True, "reason": ""}
+
+
+async def book_prop_candidates(
+    game: GameSummary, ctx: dict, book_rows: List[dict], *,
+    min_edge: float = 0.02, risk: str = "balanced",
+) -> List[dict]:
+    """Prop legs built from real book lines, ranked by measured edge.
+
+    Side follows the same rule as our own lines: take the OVER only when the
+    book's number sits at or under the player's average, and the UNDER when it
+    sits above. Either way the bet is "he performs as usual or worse" — never
+    "he has a career night".
+    """
+    if game.sport != "nba":
+        return []
+
+    legs: List[dict] = []
+    for row in book_rows:
+        player, stat, line = row["player"], row["stat"], row["line"]
+        devig_prob = row.get("devig_over_prob")
+        if devig_prob is None or stat not in STAT_LABEL:
+            continue
+
+        availability = player_availability(player, ctx)
+        if availability is None:
+            continue
+
+        averages = await player_stats.player_season_averages(
+            game.sport, game.home_team, game.away_team, player
+        )
+        if not averages or not averages.get(stat):
+            continue
+        log, mix = await player_stats.player_log_blended(
+            game.sport, str(averages.get("player_id") or "")
+        )
+        series = player_stats.stat_series(log, stat)
+        mean, sigma, source = distribution_for(series, float(averages[stat]), stat)
+        if mean <= 0 or sigma / mean > MAX_CV[stat]:
+            continue
+
+        # "Perform or underperform" — never require beating his own average.
+        side = "over" if line <= mean else "under"
+        prior = _model_prob(mean, line, stat, "over", mean)
+        over_prob = empirical_prob(series, line, prior) * availability
+        model_prob = over_prob if side == "over" else 1.0 - over_prob
+        # No prop is a lock on either side — an under can otherwise read 99%.
+        model_prob = min(MAX_LEG_PROB, await calibrated(model_prob, game.sport, risk))
+        market_prob = devig_prob if side == "over" else 1.0 - devig_prob
+        odds = row["over_odds"] if side == "over" else row["under_odds"]
+        book = row["over_book"] if side == "over" else row["under_book"]
+        if odds is None:
+            continue
+
+        verdict = evaluate_book_line(
+            model_prob=model_prob, devig_prob=market_prob, sample=len(series)
+        )
+        if not verdict["trusted"] or verdict["edge"] < min_edge:
+            continue
+
+        label = STAT_LABEL[stat]
+        hits = sum(1 for v in series if v > line)
+        legs.append(
+            {
+                "game_id": game.id,
+                "sport": game.sport,
+                "matchup": f"{game.away_team} @ {game.home_team}",
+                "market": "player_prop",
+                "selection": f"{player} {side.title()} {line:g} {label}",
+                "odds_american": int(odds),
+                "implied_prob": round(market_prob, 4),
+                "win_probability": round(model_prob, 4),
+                "fair_odds_american": american_from_prob(model_prob),
+                "availability": round(availability, 4),
+                "stat_source": source,
+                "sample_games": len(series),
+                "prior_season_games": mix.get("prior", 0),
+                "confidence": round(min(0.9, 0.5 + abs(verdict["edge"]) * 2), 4),
+                "score": round(verdict["edge"], 4),
+                "edge": verdict["edge"],
+                "model_source": "model",
+                "line_source": "book",
+                "book": book,
+                "player": player,
+                "player_id": str(averages.get("player_id") or "") or None,
+                "stat": stat,
+                "prop_line": line,
+                "prop_side": side,
+                "rationale": (
+                    f"{book} has {line:g}; he cleared it in {hits} of his last {len(series)} "
+                    f"(avg {mean:.1f}). Model {model_prob:.0%} vs market {market_prob:.0%} "
+                    f"= {verdict['edge']:+.1%} edge on the {side}."
+                ),
+            }
+        )
+
+    legs.sort(key=lambda x: x["score"], reverse=True)
     return legs

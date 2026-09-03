@@ -88,11 +88,11 @@ def patched_sources(monkeypatch):
     async def fake_leaders(sport, game_id, home, away, date=None):
         return LEADERS_BY_GAME.get(game_id, DEFAULT_LEADERS)
 
-    async def no_log(sport, athlete_id, *, limit=25):
-        return []  # season-average path unless a test opts into logs
+    async def no_log(sport, athlete_id, *, target=25, now=None):
+        return [], {"current": 0, "prior": 0}  # season-average path by default
 
     monkeypatch.setattr(props.player_stats, "player_season_averages", fake_averages)
-    monkeypatch.setattr(props.player_stats, "player_game_log", no_log)
+    monkeypatch.setattr(props.player_stats, "player_log_blended", no_log)
     monkeypatch.setattr(props.espn, "game_leaders", fake_leaders)
 
 
@@ -433,10 +433,91 @@ async def test_erratic_stat_is_skipped(monkeypatch, patched_sources):
     """A player whose stat swings wildly is noise — don't dress it up as a pick."""
     wild = [40.0, 2.0, 38.0, 1.0, 35.0, 3.0, 30.0, 0.0, 33.0, 4.0]  # cv well over the cap
 
-    async def wild_log(sport, athlete_id, *, limit=25):
-        return [{"minutes": 30.0, "points": v, "rebounds": None, "assists": None, "3pm": None}
-                for v in wild]
+    async def wild_log(sport, athlete_id, *, target=25, now=None):
+        return ([{"minutes": 30.0, "points": v, "rebounds": None, "assists": None, "3pm": None}
+                 for v in wild], {"current": len(wild), "prior": 0})
 
-    monkeypatch.setattr(props.player_stats, "player_game_log", wild_log)
+    monkeypatch.setattr(props.player_stats, "player_log_blended", wild_log)
     legs = await props.prop_parlay_candidates(_game(), {}, risk="balanced")
     assert all(not (l["player"] == "Star Guard" and l["stat"] == "points") for l in legs)
+
+
+# --- Cold start: borrowing last season when this one is thin -------------------
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+
+from app.services import player_stats as _ps  # noqa: E402
+
+
+def test_espn_season_is_the_ending_year():
+    """2025-26 is season=2026, and play starting in October rolls it forward."""
+    assert _ps.espn_season(_dt(2026, 9, 1, tzinfo=_tz.utc)) == 2026
+    assert _ps.espn_season(_dt(2026, 10, 1, tzinfo=_tz.utc)) == 2027
+    assert _ps.espn_season(_dt(2027, 2, 1, tzinfo=_tz.utc)) == 2027
+
+
+async def test_blended_log_tops_up_from_prior_season(monkeypatch):
+    """Opening night: 3 games played, so fill the rest from last year."""
+    calls = []
+
+    async def fake_log(sport, aid, *, limit=25, season_types=("regular",), season=None):
+        calls.append(season)
+        if season is None:
+            return [{"minutes": 30.0, "points": 20.0}] * 3      # current season
+        return [{"minutes": 30.0, "points": 25.0}] * limit       # prior season
+
+    monkeypatch.setattr(_ps, "player_game_log", fake_log)
+    log, mix = await _ps.player_log_blended("nba", "1", target=25,
+                                            now=_dt(2026, 10, 25, tzinfo=_tz.utc))
+    assert mix == {"current": 3, "prior": 22}
+    assert len(log) == 25
+    assert calls == [None, 2026]  # current, then last season
+    assert all(g.get("prior_season") for g in log[3:])
+
+
+async def test_blended_log_skips_fallback_when_current_is_deep(monkeypatch):
+    async def fake_log(sport, aid, *, limit=25, season_types=("regular",), season=None):
+        assert season is None, "must not reach for last season when this one suffices"
+        return [{"minutes": 30.0, "points": 20.0}] * 25
+
+    monkeypatch.setattr(_ps, "player_game_log", fake_log)
+    log, mix = await _ps.player_log_blended("nba", "1", target=25)
+    assert mix == {"current": 25, "prior": 0}
+
+
+# --- The feedback loop actually feeding back -----------------------------------
+async def test_settled_results_move_prop_probabilities(monkeypatch, patched_sources):
+    """Recorded outcomes were being collected and ignored — they must now apply."""
+    seen = {}
+
+    def fake_adjustment(sport, market, risk, prob):
+        seen["market"] = market
+        return -0.02  # pretend history says we run 2 points hot on props
+
+    async def loaded():
+        return None
+
+    monkeypatch.setattr(props, "calibration_adjustment", fake_adjustment)
+    monkeypatch.setattr(props, "ensure_calibration_loaded", loaded)
+
+    legs = await props.prop_parlay_candidates(_game(), {}, risk="safe")
+    assert legs, "expected candidates"
+    assert seen["market"] == "player_prop"
+
+    # Same legs without the correction should sit higher.
+    monkeypatch.setattr(props, "calibration_adjustment", lambda *a, **k: 0.0)
+    base = await props.prop_parlay_candidates(_game(), {}, risk="safe")
+    by_sel = {l["selection"]: l["win_probability"] for l in base}
+    for l in legs:
+        if l["selection"] in by_sel:
+            assert l["win_probability"] < by_sel[l["selection"]]
+
+
+async def test_calibration_can_disqualify_a_leg(monkeypatch, patched_sources):
+    """If history says we are badly overconfident, legs stop qualifying entirely."""
+    monkeypatch.setattr(props, "calibration_adjustment", lambda *a, **k: -0.20)
+    monkeypatch.setattr(props, "ensure_calibration_loaded", lambda: _noop())
+    assert await props.prop_parlay_candidates(_game(), {}, risk="safe") == []
+
+
+async def _noop():
+    return None
