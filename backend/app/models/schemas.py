@@ -31,10 +31,16 @@ class PickLeg(BaseModel):
     stat: Optional[str] = None
     prop_line: Optional[float] = None
     prop_side: Optional[str] = None  # "over" | "under"
+    fair_odds_american: Optional[int] = None  # break-even price for this leg
+    availability: Optional[float] = None  # P(player suits up) haircut applied
+    stat_source: Optional[str] = None  # "gamelog" | "season_avg"
+    sample_games: Optional[int] = None
     user_probability: Optional[float] = None
     edge_vs_implied: Optional[float] = None
 
 
+# "props" = player-stat legs only; "standard" = props-first, with a game
+# market (ML/spread/total) admitted only when the model edge is large.
 ParlayMode = Literal["standard", "props"]
 
 
@@ -57,6 +63,12 @@ class ParlayResponse(BaseModel):
     summary: str
     ai_insight: Optional[str] = None
     anchors: list[PickLeg] = Field(default_factory=list)  # optional high-confidence add-ons
+    # Honest parlay math: naive product vs correlation-adjusted, and what the
+    # slip is worth at the quoted price.
+    correlated_win_prob: Optional[float] = None
+    fair_combined_american: Optional[int] = None  # break-even price for the slip
+    expected_value_per_100: Optional[float] = None
+    ev_warning: Optional[str] = None
     book_check_passed: bool = True
     generated_at: datetime
 

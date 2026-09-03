@@ -56,12 +56,30 @@ function LegRow({ leg }: { leg: PickLeg }) {
         <span className="text-zinc-500">
           Model <span className="font-mono text-zinc-200">{formatPercent(leg.win_probability)}</span>
         </span>
-        <span className={edgeColor(edge)}>
-          Edge <span className="font-mono">{edge >= 0 ? "+" : ""}{(edge * 100).toFixed(1)}%</span>
-        </span>
+        {/* Prop odds are derived from our own probability, so "edge" there is
+            just the vig, not a measured disagreement with a book. Show the
+            break-even price instead — that is the number to act on. */}
+        {leg.market !== "player_prop" && (
+          <span className={edgeColor(edge)}>
+            Edge <span className="font-mono">{edge >= 0 ? "+" : ""}{(edge * 100).toFixed(1)}%</span>
+          </span>
+        )}
         {fallback && (
           <span className="rounded bg-amber-950/50 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-400">
             market only
+          </span>
+        )}
+        {leg.market === "player_prop" && leg.fair_odds_american != null && (
+          <span className="text-zinc-500">
+            Need better than{" "}
+            <span className="font-mono text-amber-300">
+              {formatAmerican(leg.fair_odds_american)}
+            </span>
+          </span>
+        )}
+        {leg.availability != null && leg.availability < 0.97 && (
+          <span className="rounded bg-amber-950/50 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-400">
+            injury risk
           </span>
         )}
       </div>
@@ -100,11 +118,16 @@ export function ParlayCard({ parlay, onAddAnchor }: Props) {
           <div className="text-right">
             <p className="text-xs text-zinc-500">Model win</p>
             <p className="text-lg font-mono text-emerald-300">
-              {formatPercent(parlay.estimated_win_prob)}
+              {formatPercent(parlay.correlated_win_prob ?? parlay.estimated_win_prob)}
             </p>
             <p className="mt-1 text-xs text-zinc-600">
               Implied {formatPercent(parlay.combined_implied_prob)}
             </p>
+            {parlay.fair_combined_american != null && (
+              <p className="mt-1 text-xs text-zinc-600">
+                Fair {formatAmerican(parlay.fair_combined_american)}
+              </p>
+            )}
           </div>
         </div>
 
@@ -115,6 +138,27 @@ export function ParlayCard({ parlay, onAddAnchor }: Props) {
         ) : (
           <p className="mb-3 inline-flex items-center gap-1 rounded-full bg-amber-950/40 px-2.5 py-1 text-[11px] text-amber-400">
             ⚠ Review legs — possible book conflict
+          </p>
+        )}
+
+        {parlay.expected_value_per_100 != null && (
+          <p
+            className={`mb-3 text-xs ${
+              parlay.expected_value_per_100 >= 0 ? "text-emerald-400" : "text-amber-400"
+            }`}
+          >
+            Expected value at this price:{" "}
+            <span className="font-mono">
+              {parlay.expected_value_per_100 >= 0 ? "+" : ""}
+              ${parlay.expected_value_per_100.toFixed(2)}
+            </span>{" "}
+            per $100 staked
+          </p>
+        )}
+
+        {parlay.ev_warning && (
+          <p className="mb-3 rounded-lg border border-amber-500/20 bg-amber-950/20 px-3 py-2 text-[11px] leading-relaxed text-amber-300/90">
+            {parlay.ev_warning}
           </p>
         )}
 

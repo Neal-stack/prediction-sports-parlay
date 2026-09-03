@@ -38,6 +38,10 @@ export type PickLeg = {
   stat?: string | null;
   prop_line?: number | null;
   prop_side?: "over" | "under" | null;
+  fair_odds_american?: number | null;
+  availability?: number | null;
+  stat_source?: "gamelog" | "season_avg" | null;
+  sample_games?: number | null;
   user_probability?: number | null;
   edge_vs_implied?: number | null;
 };
@@ -53,6 +57,10 @@ export type ParlayResponse = {
   summary: string;
   ai_insight?: string | null;
   anchors?: PickLeg[];
+  correlated_win_prob?: number | null;
+  fair_combined_american?: number | null;
+  expected_value_per_100?: number | null;
+  ev_warning?: string | null;
   book_check_passed?: boolean;
   generated_at: string;
 };

@@ -422,6 +422,84 @@ async def _collect_anchors(games: List[GameSummary], used_keys: set) -> List[Pic
 
 MAX_PROP_LEGS_PER_GAME = 2
 
+# --- Props-first policy ------------------------------------------------------
+# A game market (who wins / spread / total) only earns a spot on a slip when the
+# model disagrees with the market by a wide margin. Otherwise the slip is built
+# from player-stat legs, which is the product this engine is tuned for.
+GAME_LEG_MIN_EDGE = 0.055
+GAME_LEG_MIN_WIN = 0.58
+GAME_LEG_MAX = 1
+
+# Legs from the same game are NOT independent: a blowout benches everyone and a
+# slow pace suppresses every counting stat at once. Multiplying probabilities as
+# if independent overstates the slip, so haircut each extra shared-game leg.
+SAME_GAME_CORRELATION = 0.97
+
+
+def correlated_win_prob(legs: List[dict]) -> float:
+    """Combined probability with a penalty for legs sharing a game."""
+    prob = 1.0
+    per_game: Dict[str, int] = {}
+    for leg in legs:
+        prob *= leg["win_probability"]
+        per_game[leg["game_id"]] = per_game.get(leg["game_id"], 0) + 1
+    extra = sum(c - 1 for c in per_game.values() if c > 1)
+    return round(prob * (SAME_GAME_CORRELATION ** extra), 4)
+
+
+def parlay_ev_per_100(win_prob: float, combined_american: int) -> float:
+    """Expected profit on a $100 stake at the quoted price."""
+    return round(win_prob * payout_on_100(combined_american) - (1 - win_prob) * 100.0, 2)
+
+
+def fair_american(win_prob: float) -> int:
+    """Break-even price for the whole slip."""
+    p = max(0.005, min(0.995, win_prob))
+    return -int(round(100 * p / (1 - p))) if p >= 0.5 else int(round(100 * (1 - p) / p))
+
+
+def _ev_note(legs: List[dict], ev: float) -> Optional[str]:
+    """Say plainly what the EV number can and cannot prove."""
+    if all(l["market"] == "player_prop" for l in legs):
+        return (
+            "Prices shown are model-derived, not real book lines, so this cannot tell "
+            "you the slip is +EV. Compare each leg to your book: beat the break-even "
+            "price listed on it and that leg is worth playing. Stacking more legs "
+            "multiplies the vig — it never creates an edge."
+        )
+    if ev < 0:
+        return f"At the quoted price this is -EV: about ${ev:.0f} expected per $100 staked."
+    return None
+
+
+def _select_props_first(pool: List[dict], leg_count: int, risk: RiskLevel) -> List[dict]:
+    """Fill with player-stat legs; admit a game market only at a wide edge."""
+    prop_pool = [c for c in pool if c["market"] == "player_prop"]
+    chosen = _select_prop_legs(prop_pool, leg_count)
+
+    if len(chosen) >= leg_count:
+        return chosen
+
+    standout = [
+        c
+        for c in pool
+        if c["market"] != "player_prop"
+        and (c.get("edge") or 0.0) >= GAME_LEG_MIN_EDGE
+        and c["win_probability"] >= GAME_LEG_MIN_WIN
+    ]
+    used_games = {c["game_id"] for c in chosen}
+    added = 0
+    for cand in sorted(standout, key=lambda x: (x["edge"], x["win_probability"]), reverse=True):
+        if len(chosen) >= leg_count or added >= GAME_LEG_MAX:
+            break
+        if cand["game_id"] in used_games:  # don't correlate a game leg with its own props
+            continue
+        chosen.append(cand)
+        used_games.add(cand["game_id"])
+        added += 1
+    return chosen
+
+
 
 def _select_prop_legs(pool: List[dict], leg_count: int) -> List[dict]:
     """Greedy pick: best score first, one leg per player, capped per game."""
@@ -473,12 +551,15 @@ async def _generate_props_parlay(req: ParlayRequest) -> ParlayResponse:
 
     legs = [PickLeg(**c) for c in chosen]
     combined_american, combined_implied, estimated_win_prob = _parlay_metrics(chosen)
+    corr_prob = correlated_win_prob(chosen)
+    ev = parlay_ev_per_100(corr_prob, combined_american)
     avg_leg = sum(c["win_probability"] for c in chosen) / len(chosen)
     summary = (
         f"{profile['label']} {len(legs)}-leg NBA player-prop parlay — stat overs at "
-        f"alt lines the model puts at ~{avg_leg:.0%} each. Combined model win "
-        f"~{estimated_win_prob:.1%} ({format(combined_american, '+d')}). Lines and odds "
-        f"are model-derived from season averages — confirm prices at your book."
+        f"alt lines the model puts at ~{avg_leg:.0%} each, so the slip lands about "
+        f"{corr_prob:.0%} of the time ({format(combined_american, '+d')}). Each extra "
+        f"leg raises the payout and lowers the hit rate — it does not add value. "
+        f"Lines and odds are model-derived; confirm each price at your book."
     )
 
     return ParlayResponse(
@@ -491,6 +572,10 @@ async def _generate_props_parlay(req: ParlayRequest) -> ParlayResponse:
         same_game=len({c["game_id"] for c in chosen}) == 1,
         summary=summary,
         anchors=[],
+        correlated_win_prob=corr_prob,
+        fair_combined_american=fair_american(corr_prob),
+        expected_value_per_100=ev,
+        ev_warning=_ev_note(chosen, ev),
         book_check_passed=True,
         generated_at=datetime.now(timezone.utc),
     )
@@ -560,21 +645,52 @@ async def generate_parlay(req: ParlayRequest) -> ParlayResponse:
     for game in games:
         candidates.extend(await _candidate_legs(game, profile, req.risk))
 
+    # Props-first: fold NBA player-stat legs into the pool so they are the
+    # default building block, and team markets have to earn their place.
+    if settings.enable_player_props:
+        nba = [g for g in games[:12] if g.sport == "nba"]
+
+        async def _props_for(game: GameSummary) -> List[dict]:
+            ctx = await get_game_context(game)
+            return await props.prop_parlay_candidates(game, ctx, risk=req.risk)
+
+        for result in await asyncio.gather(*(_props_for(g) for g in nba), return_exceptions=True):
+            if isinstance(result, list):
+                candidates.extend(result)
+
     if not candidates:
         raise ValueError("No qualifying legs right now — try Balanced or another sport")
 
-    chosen = _select_parlay(candidates, req.legs, req.risk)
+    note = ""
+    chosen = _select_props_first(candidates, req.legs, req.risk)
+    if len(chosen) < 2:
+        # No props available (non-NBA slate): fall back to team markets, still
+        # preferring wide edges over "whatever is on the board".
+        standout = [c for c in candidates if (c.get("edge") or 0.0) >= GAME_LEG_MIN_EDGE]
+        try:
+            chosen = _select_parlay(standout, req.legs, req.risk)
+        except ValueError:
+            chosen = _select_parlay(candidates, req.legs, req.risk)
+            note = " No standout edges on the board — these are the best available, not high-conviction plays."
+
     legs = [PickLeg(**c) for c in chosen]
     combined_american, combined_implied, estimated_win_prob = _parlay_metrics(chosen)
+    corr_prob = correlated_win_prob(chosen)
+    ev = parlay_ev_per_100(corr_prob, combined_american)
 
     sports = ", ".join(sorted({l.sport.upper() for l in legs}))
-    avg_edge = sum(c["edge"] for c in chosen) / len(chosen)
-    fallback = any(c["model_source"] == "market_fallback" for c in chosen)
+    n_props = sum(1 for c in chosen if c["market"] == "player_prop")
+    n_game = len(chosen) - n_props
+    fallback = any(c.get("model_source") == "market_fallback" for c in chosen)
+    mix = (
+        f"{n_props} player-stat leg{'s' if n_props != 1 else ''}"
+        + (f" + {n_game} team market{'s' if n_game != 1 else ''} (wide model edge)" if n_game else "")
+    )
     summary = (
-        f"{profile['label']} {len(legs)}-leg parlay across {sports}. "
-        f"Model win ~{estimated_win_prob:.1%}, avg edge {avg_edge:+.1%} vs market "
-        f"({format(combined_american, '+d')}). Uncorrelated legs, one per game."
+        f"{profile['label']} {len(legs)}-leg parlay across {sports} — {mix}. "
+        f"Lands about {corr_prob:.0%} of the time ({format(combined_american, '+d')})."
         + (" Some legs lack team stats and are anchored to the market." if fallback else "")
+        + note
     )
 
     chosen_games = {l.game_id: g for g in games for l in legs if g.id == l.game_id}
@@ -591,6 +707,10 @@ async def generate_parlay(req: ParlayRequest) -> ParlayResponse:
         same_game=False,
         summary=summary,
         anchors=anchors,
+        correlated_win_prob=corr_prob,
+        fair_combined_american=fair_american(corr_prob),
+        expected_value_per_100=ev,
+        ev_warning=_ev_note(chosen, ev),
         book_check_passed=True,
         generated_at=datetime.now(timezone.utc),
     )
