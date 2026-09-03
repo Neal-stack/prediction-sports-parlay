@@ -247,3 +247,100 @@ async def fetch_player_box_score(
                     "3pm": _first_made(three),
                 }
     return None
+
+# --- Per-game logs (empirical distributions) --------------------------------
+# ESPN publishes a full game log per athlete, free and unkeyed. Counting how
+# often a player ACTUALLY cleared a line beats assuming a bell curve around his
+# season average — especially for a specific player/stat pair, where real
+# consistency varies enormously (a big man's rebounds are far steadier than a
+# guard's 3PM).
+WEB_API = "https://site.web.api.espn.com/apis/common/v3/sports"
+
+# Our stat key -> ESPN game-log column name.
+LOG_FIELDS = {"points": "points", "rebounds": "totalRebounds", "assists": "assists"}
+LOG_THREE = "threePointFieldGoalsMade-threePointFieldGoalsAttempted"
+
+MIN_LOG_GAMES = 8  # below this the sample is too thin to trust on its own
+
+# Reduced logs are cached separately: the raw payload is ~900KB per athlete and
+# we only need a handful of numbers from it.
+_log_cache: Dict[str, Any] = {}
+_log_cache_ts: Dict[str, datetime] = {}
+
+
+async def player_game_log(
+    sport: str, athlete_id: str, *, limit: int = 25
+) -> List[Dict[str, float]]:
+    """Most-recent-first per-game stat lines for an athlete (games played only).
+
+    Games with zero minutes (DNP) are excluded: whether he suits up is handled
+    separately by the availability model, so counting DNPs here would penalise
+    the stat distribution twice.
+    """
+    if sport != "nba" or not athlete_id:
+        return []
+
+    key = f"{sport}:{athlete_id}:{limit}"
+    ts = _log_cache_ts.get(key)
+    if ts and datetime.now(timezone.utc) - ts < timedelta(hours=12):
+        return _log_cache.get(key, [])
+
+    path = espn.SPORT_PATHS.get(sport)
+    if not path:
+        return []
+    url = f"{WEB_API}/{path[0]}/{path[1]}/athletes/{athlete_id}/gamelog"
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return _log_cache.get(key, [])
+            data = resp.json()
+    except Exception:
+        logger.exception("ESPN gamelog request failed for athlete %s", athlete_id)
+        return _log_cache.get(key, [])
+
+    names = data.get("names") or []
+    idx = {name: i for i, name in enumerate(names)}
+
+    def _col(row: List[str], name: str) -> Optional[float]:
+        i = idx.get(name)
+        if i is None or i >= len(row):
+            return None
+        try:
+            return float(row[i])
+        except (ValueError, TypeError):
+            return None
+
+    out: List[Dict[str, float]] = []
+    for season in data.get("seasonTypes") or []:
+        for cat in season.get("categories") or []:
+            for event in cat.get("events") or []:
+                row = event.get("stats") or []
+                if not row:
+                    continue
+                minutes = _col(row, "minutes") or 0.0
+                if minutes <= 0:  # DNP — availability model's problem, not ours
+                    continue
+                line = {
+                    "minutes": minutes,
+                    "points": _col(row, LOG_FIELDS["points"]),
+                    "rebounds": _col(row, LOG_FIELDS["rebounds"]),
+                    "assists": _col(row, LOG_FIELDS["assists"]),
+                    "3pm": _first_made(row[idx[LOG_THREE]]) if LOG_THREE in idx and idx[LOG_THREE] < len(row) else None,
+                }
+                out.append(line)
+                if len(out) >= limit:
+                    break
+            if len(out) >= limit:
+                break
+        if len(out) >= limit:
+            break
+
+    _log_cache[key] = out
+    _log_cache_ts[key] = datetime.now(timezone.utc)
+    return out
+
+
+def stat_series(log: List[Dict[str, float]], stat: str) -> List[float]:
+    """Just the values for one stat, dropping games where it is missing."""
+    return [g[stat] for g in log if g.get(stat) is not None]
