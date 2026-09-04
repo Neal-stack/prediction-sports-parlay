@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     odds_sync_minutes: int = 15
     research_ttl_minutes: int = 30
     enable_player_props: bool = True
+    # Book prop lines cost ~4 credits per game (markets x regions), so cap how
+    # many games we price per generation. 8 games = ~32 credits.
+    prop_line_max_games: int = 8
+    use_book_prop_lines: bool = True
 
     @property
     def cors_origin_list(self) -> List[str]:

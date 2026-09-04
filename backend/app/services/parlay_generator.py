@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app.models.schemas import GameSummary, ParlayRequest, ParlayResponse, PickLeg, RiskLevel
 from app.config import settings
-from app.services import espn, power_model, props
+from app.services import espn, power_model, prop_lines, props
 from app.services.ai_assistant import explain_parlay
 from app.services.calibration import calibration_adjustment, ensure_calibration_loaded
 from app.services.context import get_game_context
@@ -460,12 +460,19 @@ def fair_american(win_prob: float) -> int:
 
 def _ev_note(legs: List[dict], ev: float) -> Optional[str]:
     """Say plainly what the EV number can and cannot prove."""
-    if all(l["market"] == "player_prop" for l in legs):
+    model_priced = [l for l in legs if l.get("line_source") != "book"]
+    if model_priced and len(model_priced) == len(legs):
         return (
             "Prices shown are model-derived, not real book lines, so this cannot tell "
             "you the slip is +EV. Compare each leg to your book: beat the break-even "
             "price listed on it and that leg is worth playing. Stacking more legs "
             "multiplies the vig — it never creates an edge."
+        )
+    if model_priced:
+        return (
+            f"{len(model_priced)} of {len(legs)} legs use model-derived prices — confirm "
+            f"those at your book. The rest are priced against real lines, so their edge "
+            f"is measured rather than assumed."
         )
     if ev < 0:
         return f"At the quoted price this is -EV: about ${ev:.0f} expected per $100 staked."
@@ -521,6 +528,63 @@ def _select_prop_legs(pool: List[dict], leg_count: int) -> List[dict]:
     return chosen
 
 
+async def _book_prop_pool(games: List[GameSummary], risk: RiskLevel) -> List[dict]:
+    """Prop legs priced against real book lines.
+
+    Costs roughly 4 credits per game (one per market), so the slate is capped
+    and results are cached upstream. Listing events is free, so a game with no
+    posted props costs nothing.
+    """
+    if not (settings.use_book_prop_lines and settings.odds_api_key):
+        return []
+    nba = [g for g in games if g.sport == "nba"][: settings.prop_line_max_games]
+    if not nba:
+        return []
+    events = await prop_lines.list_events("nba")  # free endpoint
+    if not events:
+        return []
+
+    pool: List[dict] = []
+    for game in nba:
+        event_id = prop_lines.match_event(events, game.home_team, game.away_team)
+        if not event_id:
+            continue
+        rows = await prop_lines.fetch_event_props("nba", event_id)
+        if not rows:
+            continue
+        ctx = await get_game_context(game)
+        pool.extend(await props.book_prop_candidates(game, ctx, rows, risk=risk))
+    return pool
+
+
+async def _prop_pool(games: List[GameSummary], risk: RiskLevel) -> List[dict]:
+    """Book-anchored legs first; model-derived lines only fill what is missing.
+
+    A leg priced against a real market has a measured edge. A model-derived one
+    has, by construction, an edge of roughly minus the vig — useful for finding
+    a number to shop, not for claiming value.
+    """
+    book = await _book_prop_pool(games, risk)
+    have = {(leg["game_id"], (leg.get("player") or "").lower(), leg.get("stat")) for leg in book}
+
+    model: List[dict] = []
+    async def _model_for(game: GameSummary) -> List[dict]:
+        ctx = await get_game_context(game)
+        return await props.prop_parlay_candidates(game, ctx, risk=risk)
+
+    results = await asyncio.gather(*(_model_for(g) for g in games[:12]), return_exceptions=True)
+    for result in results:
+        if not isinstance(result, list):
+            continue
+        for leg in result:
+            key = (leg["game_id"], (leg.get("player") or "").lower(), leg.get("stat"))
+            if key in have:  # never duplicate a player/stat we already priced
+                continue
+            leg.setdefault("line_source", "model")
+            model.append(leg)
+    return book + model
+
+
 async def _generate_props_parlay(req: ParlayRequest) -> ParlayResponse:
     if not settings.enable_player_props:
         raise ValueError("Player props are disabled — set ENABLE_PLAYER_PROPS=true")
@@ -534,12 +598,7 @@ async def _generate_props_parlay(req: ParlayRequest) -> ParlayResponse:
     if not games:
         raise ValueError("No NBA games on the board — check back on a game day")
 
-    async def _cands(game: GameSummary) -> List[dict]:
-        ctx = await get_game_context(game)
-        return await props.prop_parlay_candidates(game, ctx, risk=req.risk)
-
-    results = await asyncio.gather(*(_cands(g) for g in games[:12]), return_exceptions=True)
-    pool = [leg for r in results if isinstance(r, list) for leg in r]
+    pool = await _prop_pool(games, req.risk)
     if not pool:
         raise ValueError(
             "No qualifying player props today — player averages may be unavailable (offseason?)"
@@ -554,12 +613,19 @@ async def _generate_props_parlay(req: ParlayRequest) -> ParlayResponse:
     corr_prob = correlated_win_prob(chosen)
     ev = parlay_ev_per_100(corr_prob, combined_american)
     avg_leg = sum(c["win_probability"] for c in chosen) / len(chosen)
+    n_book = sum(1 for c in chosen if c.get("line_source") == "book")
+    if n_book == len(chosen):
+        provenance = "priced against live book lines, so the edges are measured"
+    elif n_book:
+        provenance = (f"{n_book} of {len(chosen)} priced against live book lines; "
+                      f"confirm the rest at your book")
+    else:
+        provenance = "built on model-derived lines; confirm every price at your book"
     summary = (
-        f"{profile['label']} {len(legs)}-leg NBA player-prop parlay — stat overs at "
-        f"alt lines the model puts at ~{avg_leg:.0%} each, so the slip lands about "
-        f"{corr_prob:.0%} of the time ({format(combined_american, '+d')}). Each extra "
-        f"leg raises the payout and lowers the hit rate — it does not add value. "
-        f"Lines and odds are model-derived; confirm each price at your book."
+        f"{profile['label']} {len(legs)}-leg NBA player-prop parlay — {provenance}. "
+        f"Legs average ~{avg_leg:.0%}, so the slip lands about {corr_prob:.0%} of the "
+        f"time ({format(combined_american, '+d')}). Each extra leg raises the payout and "
+        f"lowers the hit rate — it does not add value."
     )
 
     return ParlayResponse(
@@ -648,15 +714,7 @@ async def generate_parlay(req: ParlayRequest) -> ParlayResponse:
     # Props-first: fold NBA player-stat legs into the pool so they are the
     # default building block, and team markets have to earn their place.
     if settings.enable_player_props:
-        nba = [g for g in games[:12] if g.sport == "nba"]
-
-        async def _props_for(game: GameSummary) -> List[dict]:
-            ctx = await get_game_context(game)
-            return await props.prop_parlay_candidates(game, ctx, risk=req.risk)
-
-        for result in await asyncio.gather(*(_props_for(g) for g in nba), return_exceptions=True):
-            if isinstance(result, list):
-                candidates.extend(result)
+        candidates.extend(await _prop_pool([g for g in games if g.sport == "nba"], req.risk))
 
     if not candidates:
         raise ValueError("No qualifying legs right now — try Balanced or another sport")

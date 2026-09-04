@@ -41,6 +41,9 @@ export type PickLeg = {
   fair_odds_american?: number | null;
   availability?: number | null;
   stat_source?: "gamelog" | "season_avg" | null;
+  line_source?: "book" | "model" | null;
+  book?: string | null;
+  prior_season_games?: number | null;
   sample_games?: number | null;
   user_probability?: number | null;
   edge_vs_implied?: number | null;

@@ -225,3 +225,76 @@ async def test_book_candidate_drops_injured_player(mocked_player):
 async def test_book_candidate_carries_best_book_through(mocked_player):
     legs = await props.book_prop_candidates(_game(), {}, [_row(17.5, -200, 165)], min_edge=0.0)
     assert legs[0]["book"] == "bookA" and legs[0]["odds_american"] == -200
+
+
+# --- Generator prefers real lines over invented ones ---------------------------
+from app.services import parlay_generator as _pg  # noqa: E402
+
+
+async def test_prop_pool_prefers_book_and_dedupes(monkeypatch):
+    """A player/stat already priced by a book must not reappear model-priced."""
+    game = _game()
+
+    async def fake_book(games, risk):
+        return [{"game_id": "g1", "player": "Test Player", "stat": "points",
+                 "market": "player_prop", "line_source": "book", "score": 0.9,
+                 "win_probability": 0.6, "edge": 0.05}]
+
+    async def fake_model(g, ctx, *, risk):
+        return [
+            {"game_id": "g1", "player": "Test Player", "stat": "points",   # duplicate
+             "market": "player_prop", "score": 0.8, "win_probability": 0.7, "edge": -0.03},
+            {"game_id": "g1", "player": "Other Guy", "stat": "rebounds",   # new
+             "market": "player_prop", "score": 0.7, "win_probability": 0.7, "edge": -0.03},
+        ]
+
+    async def fake_ctx(g):
+        return {}
+
+    monkeypatch.setattr(_pg, "_book_prop_pool", fake_book)
+    monkeypatch.setattr(_pg.props, "prop_parlay_candidates", fake_model)
+    monkeypatch.setattr(_pg, "get_game_context", fake_ctx)
+
+    pool = await _pg._prop_pool([game], "balanced")
+    keys = [(p["player"], p["stat"], p.get("line_source", "model")) for p in pool]
+    assert ("Test Player", "points", "book") in keys
+    assert ("Test Player", "points", "model") not in keys   # deduped
+    assert ("Other Guy", "rebounds", "model") in keys       # kept as filler
+
+
+async def test_book_pool_skipped_without_api_key(monkeypatch):
+    monkeypatch.setattr(_pg.settings, "odds_api_key", "")
+    assert await _pg._book_prop_pool([_game()], "balanced") == []
+
+
+async def test_book_pool_respects_game_cap(monkeypatch):
+    """Each game costs credits, so the slate must be capped."""
+    seen = []
+
+    async def fake_events(sport):
+        return [{"id": f"e{i}", "home_team": f"Home{i}", "away_team": f"Away{i}"} for i in range(20)]
+
+    async def fake_fetch(sport, eid, stats=None):
+        seen.append(eid)
+        return []
+
+    monkeypatch.setattr(_pg.settings, "odds_api_key", "k")
+    monkeypatch.setattr(_pg.settings, "prop_line_max_games", 3)
+    monkeypatch.setattr(_pg.prop_lines, "list_events", fake_events)
+    monkeypatch.setattr(_pg.prop_lines, "fetch_event_props", fake_fetch)
+
+    games = [GameSummary(id=f"g{i}", sport="nba", home_team=f"Home{i}", away_team=f"Away{i}",
+                         start_time=datetime(2026, 10, 20, tzinfo=timezone.utc)) for i in range(20)]
+    await _pg._book_prop_pool(games, "balanced")
+    assert len(seen) == 3
+
+
+def test_ev_note_distinguishes_book_from_model_prices():
+    book = [{"market": "player_prop", "line_source": "book"}] * 2
+    mixed = book + [{"market": "player_prop", "line_source": "model"}]
+    model = [{"market": "player_prop", "line_source": "model"}] * 2
+
+    assert _pg._ev_note(book, ev=5.0) is None                      # real prices, +EV
+    assert "measured" in _pg._ev_note(mixed, ev=5.0)
+    assert "cannot tell" in _pg._ev_note(model, ev=5.0)
+    assert "-EV" in _pg._ev_note(book, ev=-5.0)

@@ -69,7 +69,12 @@ function LegRow({ leg }: { leg: PickLeg }) {
             market only
           </span>
         )}
-        {leg.market === "player_prop" && leg.fair_odds_american != null && (
+        {leg.line_source === "book" && leg.book && (
+          <span className="rounded bg-emerald-950/50 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-emerald-400">
+            {leg.book} line
+          </span>
+        )}
+        {leg.market === "player_prop" && leg.line_source !== "book" && leg.fair_odds_american != null && (
           <span className="text-zinc-500">
             Need better than{" "}
             <span className="font-mono text-amber-300">
